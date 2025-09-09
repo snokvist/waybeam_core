@@ -167,23 +167,23 @@ install:
 	@echo "== Install / Deploy (only if built; best-effort) =="
 	@if [ -x "$(BUILD_DIR)/native/waybeam_core" ]; then \
 	  echo "Local install: $(BUILD_DIR)/native/waybeam_core -> $(INSTALL_NATIVE_DIR) (with sudo)"; \
-	  -$(SUDO) cp "$(BUILD_DIR)/native/waybeam_core" "$(INSTALL_NATIVE_DIR)" || echo "WARN: local install failed"; \
+	  $(SUDO) cp "$(BUILD_DIR)/native/waybeam_core" "$(INSTALL_NATIVE_DIR)" || echo "WARN: local install failed"; \
 	else echo "Skip native (not built)"; fi
 	@if [ -x "$(BUILD_DIR)/arm-gnu/waybeam_core" ]; then \
 	  echo "Deploy arm-gnu to $(ARM_GNU_USER)@$(ARM_GNU_HOST):$(REMOTE_BIN_DIR)"; \
-	  -scp -O "$(BUILD_DIR)/arm-gnu/waybeam_core" "$(ARM_GNU_USER)@$(ARM_GNU_HOST):$(REMOTE_BIN_DIR)" || echo "WARN: arm-gnu deploy failed"; \
+	  scp -O "$(BUILD_DIR)/arm-gnu/waybeam_core" "$(ARM_GNU_USER)@$(ARM_GNU_HOST):$(REMOTE_BIN_DIR)" || echo "WARN: arm-gnu deploy failed"; \
 	else echo "Skip arm-gnu (not built)"; fi
 	@if [ -x "$(BUILD_DIR)/arm-musl/waybeam_core" ]; then \
 	  echo "Deploy arm-musl to $(ARM_MUSL_USER)@$(ARM_MUSL_HOST):$(REMOTE_BIN_DIR)"; \
-	  -scp -O "$(BUILD_DIR)/arm-musl/waybeam_core" "$(ARM_MUSL_USER)@$(ARM_MUSL_HOST):$(REMOTE_BIN_DIR)" || echo "WARN: arm-musl deploy failed"; \
+	  scp -O "$(BUILD_DIR)/arm-musl/waybeam_core" "$(ARM_MUSL_USER)@$(ARM_MUSL_HOST):$(REMOTE_BIN_DIR)" || echo "WARN: arm-musl deploy failed"; \
 	else echo "Skip arm-musl (not built)"; fi
 	@if [ -x "$(BUILD_DIR)/aarch64-gnu/waybeam_core" ]; then \
 	  echo "Deploy aarch64-gnu to $(AARCH64_GNU_USER)@$(AARCH64_GNU_HOST):$(REMOTE_BIN_DIR)"; \
-	  -scp -O "$(BUILD_DIR)/aarch64-gnu/waybeam_core" "$(AARCH64_GNU_USER)@$(AARCH64_GNU_HOST):$(REMOTE_BIN_DIR)" || echo "WARN: aarch64-gnu deploy failed"; \
+	  scp -O "$(BUILD_DIR)/aarch64-gnu/waybeam_core" "$(AARCH64_GNU_USER)@$(AARCH64_GNU_HOST):$(REMOTE_BIN_DIR)" || echo "WARN: aarch64-gnu deploy failed"; \
 	else echo "Skip aarch64-gnu (not built)"; fi
 	@if [ -x "$(BUILD_DIR)/mipsel-openwrt/waybeam_core" ]; then \
 	  echo "Deploy mipsel-openwrt to $(MIPSEL_OPENWRT_USER)@$(MIPSEL_OPENWRT_HOST):$(REMOTE_BIN_DIR)"; \
-	  -scp -O "$(BUILD_DIR)/mipsel-openwrt/waybeam_core" "$(MIPSEL_OPENWRT_USER)@$(MIPSEL_OPENWRT_HOST):$(REMOTE_BIN_DIR)" || echo "WARN: mipsel-openwrt deploy failed"; \
+	  scp -O "$(BUILD_DIR)/mipsel-openwrt/waybeam_core" "$(MIPSEL_OPENWRT_USER)@$(MIPSEL_OPENWRT_HOST):$(REMOTE_BIN_DIR)" || echo "WARN: mipsel-openwrt deploy failed"; \
 	else echo "Skip mipsel-openwrt (not built)"; fi
 
 # ===== Strip all binaries that exist (best-effort) =====
