@@ -1,0 +1,681 @@
+<!doctype html>
+<html lang="en" x-data="app()" x-init="init()">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Waybeam Ultralite — Alpine</title>
+
+  <link rel="stylesheet" href="app.css" />
+
+  <!-- Tell Alpine to wait until our app is defined -->
+  <script>
+    window.deferLoadingAlpine = (init)=>{ window._alpineInit = init; };
+  </script>
+  <!-- App logic first -->
+  <script defer src="app.js"></script>
+  <!-- Local Alpine starts after app.js is ready -->
+  <script defer src="vendor/alpinejs/alpine.min.js"
+          onload="window._alpineInit && window._alpineInit()"></script>
+</head>
+<body>
+
+  <!-- Header -->
+  <div class="top">
+    <div class="wrap row space pad-10">
+      <div class="row">
+        <span class="dot" :class="uiConnected ? 'ok' : 'bad'"></span>
+        <div class="xs muted" x-text="uiConnected ? 'Connected' : 'Disconnected'"></div>
+        <span class="tag ml-8">TX <b x-text="stats.tx"></b></span>
+        <span class="tag">RX <b x-text="stats.rx"></b></span>
+      </div>
+      <div class="row">
+        <span class="pill">Waybeam Ultralite</span>
+        <button class="btn" @click="openSettings()">Settings</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="wrap">
+    <!-- Step header -->
+    <div class="row space mt-10 mb-6">
+      <button class="btn ghost" @click="goBack()">← Back</button>
+      <div class="hdr" x-text="prettyStep()"></div>
+      <span class="w-56"></span>
+    </div>
+
+    <!-- STEP: ROLE -->
+    <div class="list" x-show="step==='role'">
+      <button class="rowitem" @click="selectRole('beacon')">
+        <div>📡</div><div class="grow">
+          <div class="title f15">Beacon</div>
+          <div class="xs muted">tap to select</div>
+        </div><div class="muted">›</div>
+      </button>
+      <button class="rowitem" @click="selectRole('porthole')">
+        <div>🖥️</div><div class="grow">
+          <div class="title f15">Porthole</div>
+          <div class="xs muted">tap to select</div>
+        </div><div class="muted">›</div>
+      </button>
+      <button class="rowitem" @click="selectRole('relay')">
+        <div>🔀</div><div class="grow">
+          <div class="title f15">Relay</div>
+          <div class="xs muted">tap to select</div>
+        </div><div class="muted">›</div>
+      </button>
+    </div>
+
+    <!-- BEACON LIST -->
+    <div x-show="step==='beacon'">
+      <div class="row space mb-6">
+        <div class="title">Beacons <span class="muted fw600">(<span x-text="beacons.length"></span>)</span></div>
+        <div class="xs muted">Tap to select</div>
+      </div>
+      <div class="list">
+        <template x-for="n in beacons" :key="n.src_id">
+          <button class="rowitem" @click="selectBeacon(n)">
+            <div>📡</div>
+            <div class="grow">
+              <div class="title f15" x-text="n.alias || n.src_id.slice(0,8)"></div>
+              <div class="xs muted mono" x-text="`${n.ip}:${n.port||0}`"></div>
+            </div>
+            <div class="muted">›</div>
+          </button>
+        </template>
+        <div class="card" x-show="beacons.length===0">No beacons yet. Waiting for hail…</div>
+      </div>
+    </div>
+
+    <!-- PORTHOLE LIST (Role view; unchanged) -->
+    <div x-show="step==='porthole'">
+      <div class="row space mb-6">
+        <div class="title">Portholes <span class="muted fw600">(<span x-text="portholes.length"></span>)</span></div>
+        <div class="xs muted">Tap to select</div>
+      </div>
+      <div class="list">
+        <template x-for="n in portholes" :key="n.src_id">
+          <button class="rowitem" @click="selectPorthole(n)">
+            <div>🖥️</div>
+            <div class="grow">
+              <div class="title f15" x-text="n.alias || n.src_id.slice(0,8)"></div>
+              <div class="xs muted mono" x-text="n.ip"></div>
+            </div>
+            <div class="muted" x-text="n.src_id==='static:multicast' ? 'Multicast' : '›'"></div>
+          </button>
+        </template>
+        <div class="card" x-show="portholes.length===0">No portholes yet. Power on a viewer…</div>
+      </div>
+    </div>
+
+    <!-- RELAY LIST -->
+    <div x-show="step==='relay'">
+      <div class="row space mb-6">
+        <div class="title">Relays <span class="muted fw600">(<span x-text="relays.length"></span>)</span></div>
+        <div class="xs muted">Tap to select</div>
+      </div>
+      <div class="list">
+        <template x-for="n in relays" :key="n.src_id">
+          <button class="rowitem" @click="selectRelay(n)">
+            <div>🔀</div>
+            <div class="grow">
+              <div class="title f15" x-text="n.alias || n.src_id.slice(0,8)"></div>
+              <div class="xs muted mono" x-text="n.ip"></div>
+            </div>
+            <div class="muted">›</div>
+          </button>
+        </template>
+        <template x-if="relays.length===0">
+          <div class="card">No relays detected.</div>
+        </template>
+      </div>
+    </div>
+
+    <!-- ACTIONS (BEACON) -->
+    <div class="card" x-show="step==='actions_beacon'">
+      <div class="title mb-10">Actions — Beacon</div>
+
+      <div class="row gap-10 mb-12">
+        <button class="btn grad flex1" @click="doCast()">▶️ Start Beam</button>
+        <button class="btn danger flex1" @click="doStop()">⏹️ Stop Beam</button>
+      </div>
+
+      <!-- Selected porthole + inline pickers (NO navigation) -->
+      <div class="card mb-12" @click.outside="portholePickerOpen=false">
+        <div class="xs muted mb-6">Selected Porthole</div>
+
+        <div class="row space">
+          <!-- Button-looking row toggles the picker -->
+          <button class="rowitem flex1" @click="portholePickerOpen=!portholePickerOpen">
+            <div>🖥️</div>
+            <div class="grow">
+              <div class="title f15" x-text="porthole? (porthole.alias||'Porthole') : '—'"></div>
+              <div class="xs muted mono">
+                <span x-text="porthole? (porthole.ip) : '—'"></span>
+                <span> · Port: </span>
+                <span x-text="castPort"></span>
+              </div>
+            </div>
+            <div class="muted" x-text="portholePickerOpen ? '⤵' : '▼'"></div>
+          </button>
+
+          <!-- Port mini-select (independent) -->
+          <div class="ml-8">
+            <label class="xs muted block mb-6">Port</label>
+            <select class="select mini"
+                    :value="castPort"
+                    @click.stop
+                    @change="setCastPort(Number($event.target.value))">
+              <template x-for="p in portOptions()" :key="`p-${p}`">
+                <option :value="Number(p)" x-text="p"></option>
+              </template>
+            </select>
+          </div>
+        </div>
+
+        <!-- Drop-down list of portholes (styled same as role list) -->
+        <div class="mt-10" x-show="portholePickerOpen" x-transition>
+          <div class="list">
+            <template x-for="n in portholes" :key="`pick-${n.src_id}`">
+              <button class="rowitem" @click.stop="selectPortholeForBeacon(n)">
+                <div>🖥️</div>
+                <div class="grow">
+                  <div class="title f15" x-text="n.alias || n.src_id.slice(0,8)"></div>
+                  <div class="xs muted mono" x-text="n.ip"></div>
+                </div>
+                <div class="muted" x-text="n.src_id==='static:multicast' ? 'Multicast' : (porthole && porthole.src_id===n.src_id ? '✓' : 'Use')"></div>
+              </button>
+            </template>
+          </div>
+        </div>
+      </div>
+
+      <label>
+        <div class="xs muted mb-6">Lane</div>
+        <select class="select" x-model="params.lane">
+          <template x-for="opt in laneOptions()" :key="opt">
+            <option :value="opt" x-text="opt==='Default' ? 'Default' : opt.toUpperCase()"></option>
+          </template>
+        </select>
+      </label>
+
+      <!-- Static sliders -->
+      <div class="list mt-12">
+        <div>
+          <div class="xs muted mb-6">Exposure</div>
+          <div class="row space mb-6">
+            <div class="xs muted" x-text="rangeGet('isp.exposure','min',5)"></div>
+            <div class="mono chip" x-text="params.isp.exposure"></div>
+          </div>
+          <input type="range" class="slider"
+            :min="rangeGet('isp.exposure','min',5)"
+            :max="rangeGet('isp.exposure','max',16)"
+            :step="rangeGet('isp.exposure','step',1)"
+            :value="params.isp.exposure"
+            @input="onRange('isp.exposure',$event.target.value,'beacon')">
+        </div>
+
+        <div>
+          <div class="xs muted mb-6">Contrast</div>
+          <div class="row space mb-6">
+            <div class="xs muted" x-text="rangeGet('image.contrast','min',0)"></div>
+            <div class="mono chip" x-text="params.image.contrast"></div>
+          </div>
+          <input type="range" class="slider"
+            :min="rangeGet('image.contrast','min',0)"
+            :max="rangeGet('image.contrast','max',100)"
+            :step="rangeGet('image.contrast','step',5)"
+            :value="params.image.contrast"
+            @input="onRange('image.contrast',$event.target.value,'beacon')">
+        </div>
+
+        <div>
+          <div class="xs muted mb-6">Hue</div>
+          <div class="row space mb-6">
+            <div class="xs muted" x-text="rangeGet('image.hue','min',0)"></div>
+            <div class="mono chip" x-text="params.image.hue"></div>
+          </div>
+          <input type="range" class="slider"
+            :min="rangeGet('image.hue','min',0)"
+            :max="rangeGet('image.hue','max',100)"
+            :step="rangeGet('image.hue','step',5)"
+            :value="params.image.hue"
+            @input="onRange('image.hue',$event.target.value,'beacon')">
+        </div>
+
+        <div>
+          <div class="xs muted mb-6">Luminance</div>
+          <div class="row space mb-6">
+            <div class="xs muted" x-text="rangeGet('image.luminance','min',0)"></div>
+            <div class="mono chip" x-text="params.image.luminance"></div>
+          </div>
+          <input type="range" class="slider"
+            :min="rangeGet('image.luminance','min',0)"
+            :max="rangeGet('image.luminance','max',100)"
+            :step="rangeGet('image.luminance','step',5)"
+            :value="params.image.luminance"
+            @input="onRange('image.luminance',$event.target.value,'beacon')">
+        </div>
+
+        <div>
+          <div class="xs muted mb-6">Bitrate (kbps)</div>
+          <div class="row space mb-6">
+            <div class="xs muted">Low</div>
+            <div class="mono chip" x-text="params.video0.bitrate"></div>
+          </div>
+          <input type="range" class="slider"
+            :min="rangeGet('video0.bitrate','min',256)"
+            :max="rangeGet('video0.bitrate','max',20000)"
+            :step="rangeGet('video0.bitrate','step',256)"
+            :value="params.video0.bitrate"
+            @input="onRange('video0.bitrate',$event.target.value,'beacon')">
+        </div>
+
+        <!-- Auto sliders (Beacon) -->
+        <template x-for="ctrl in autoControlsGrouped(activeAccept('beacon')).ranges" :key="`rng:${ctrl.path}`">
+          <div>
+            <div class="xs muted mb-6" x-text="prettyLabel(ctrl.label)"></div>
+            <div class="row space mb-6">
+              <div class="xs muted" x-text="String(ctrl.min)"></div>
+              <div class="mono chip" x-text="paramGet(ctrl.path)"></div>
+            </div>
+            <input type="range" class="slider"
+                   :min="ctrl.min" :max="ctrl.max" :step="ctrl.step||1"
+                   :value="paramGet(ctrl.path)"
+                   @input="onRange(ctrl.path, $event.target.value, 'beacon')">
+          </div>
+        </template>
+      </div>
+
+      <!-- Selects -->
+      <div class="list mt-12">
+        <label>
+          <div class="xs muted mb-6">Codec</div>
+          <select class="select"
+                  :value="params.video0.codec"
+                  @change="onSelect('video0.codec',$event.target.value,'beacon')">
+            <template x-for="opt in listGet('video0.codec',['h265','h264'])" :key="opt">
+              <option :value="opt" x-text="opt.toUpperCase()"></option>
+            </template>
+          </select>
+        </label>
+
+        <label>
+          <div class="xs muted mb-6">FPS</div>
+          <select class="select"
+                  :value="params.video0.fps"
+                  @change="onSelect('video0.fps',Number($event.target.value),'beacon')">
+            <template x-for="opt in listGet('video0.fps',[10,30,60,90,120])" :key="`fps-${opt}`">
+              <option :value="Number(opt)" x-text="opt"></option>
+            </template>
+          </select>
+        </label>
+
+        <label>
+          <div class="xs muted mb-6">Frame Size</div>
+          <select class="select"
+                  :value="params.video0.size"
+                  @change="onSelect('video0.size',$event.target.value,'beacon')">
+            <template x-for="opt in listGet('video0.size',['1280x720','1920x1080','1080x1440'])" :key="`sz-${opt}`">
+              <option :value="String(opt)" x-text="String(opt).replace('x','×')"></option>
+            </template>
+          </select>
+        </label>
+
+        <label>
+          <div class="xs muted mb-6">Rate Control</div>
+          <select class="select"
+                  :value="params.video0.rcMode"
+                  @change="onSelect('video0.rcMode',$event.target.value,'beacon')">
+            <template x-for="opt in listGet('video0.rcMode',['cbr','avbr'])" :key="`rc-${opt}`">
+              <option :value="String(opt)" x-text="String(opt).toUpperCase()"></option>
+            </template>
+          </select>
+        </label>
+
+        <label>
+          <div class="xs muted mb-6">GOP Size</div>
+          <select class="select"
+                  :value="params.video0.gopSize"
+                  @change="onSelect('video0.gopSize',Number($event.target.value),'beacon')">
+            <template x-for="opt in listGet('video0.gopSize',[0.25,0.5,0.75,1,2,3,5,10])" :key="`gop-${opt}`">
+              <option :value="Number(opt)" x-text="opt"></option>
+            </template>
+          </select>
+        </label>
+
+        <!-- Auto selects (Beacon) -->
+        <template x-for="ctrl in autoControlsGrouped(activeAccept('beacon')).selects" :key="`sel:${ctrl.path}`">
+          <label>
+            <div class="xs muted mb-6" x-text="prettyLabel(ctrl.label)"></div>
+            <select class="select"
+                    :value="String(paramGet(ctrl.path))"
+                    @change="onSelect(ctrl.path, $event.target.value, 'beacon')">
+              <template x-for="opt in ctrl.options" :key="`opt:${ctrl.path}:${String(opt)}`">
+                <option :value="String(opt)" x-text="String(opt)"></option>
+              </template>
+            </select>
+          </label>
+        </template>
+      </div>
+
+      <!-- Toggles -->
+      <div class="list mt-12">
+        <div class="row space rowitem pad-10">
+          <div class="xs muted">Audio Enabled</div>
+          <label class="switch">
+            <input type="checkbox"
+                   :checked="params.audio.enabled"
+                   @change="onToggle('audio.enabled',$event.target.checked,'beacon')">
+            <span class="track"></span>
+          </label>
+        </div>
+
+        <div class="row space rowitem pad-10">
+          <div class="xs muted">Recording Enabled</div>
+          <label class="switch">
+            <input type="checkbox"
+                   :checked="params.records.enabled"
+                   @change="onToggle('records.enabled',$event.target.checked,'beacon')">
+            <span class="track"></span>
+          </label>
+        </div>
+
+        <!-- Auto toggles (Beacon) -->
+        <template x-for="ctrl in autoControlsGrouped(activeAccept('beacon')).toggles" :key="`tgl:${ctrl.path}`">
+          <div class="row space rowitem pad-10">
+            <div class="xs muted" x-text="prettyLabel(ctrl.label)"></div>
+            <label class="switch">
+              <input type="checkbox"
+                     :checked="!!paramGet(ctrl.path)"
+                     @change="onToggle(ctrl.path,$event.target.checked,'beacon')">
+              <span class="track"></span>
+            </label>
+          </div>
+        </template>
+      </div>
+
+      <!-- Update & Preview -->
+      <div class="row gap-10 mt-12">
+        <button class="btn grad block w-100" @click="doUpdate()">💾 Update Beam</button>
+      </div>
+
+      <!-- Inline MJPEG preview -->
+      <div class="card mt-12">
+        <div class="row space">
+          <button class="rowitem flex1" @click="toggleInlinePreview()">
+            <div>🖼️</div>
+            <div class="grow">
+              <div class="title f15">Preview (inline)</div>
+              <div class="xs muted mono" x-text="beacon ? (beacon.ip + mjpeg) : 'Pick a Beacon'"></div>
+            </div>
+            <div class="muted" x-text="inlinePreviewOpen ? '⤵' : '▶'"></div>
+          </button>
+          <button class="btn ml-8" @click="doRequestFor('beacon')">⟳ Load current</button>
+        </div>
+
+        <div class="mjpeg-box" x-show="inlinePreviewOpen" x-transition>
+          <img x-ref="mjpegImg"
+               :src="inlinePreviewUrl"
+               @load="onInlineImgLoaded"
+               @error="onInlineImgError"
+               alt="MJPEG preview">
+        </div>
+
+        <div class="xs mt-6">
+          <template x-if="inlineState==='loading'">
+            <span>Loading preview…</span>
+          </template>
+          <template x-if="inlineState==='ok'">
+            <span>Live preview playing.</span>
+          </template>
+          <template x-if="inlineState==='fail'">
+            <span>
+              Couldn’t load inline preview. You can still
+              <a class="link" :href="mjpegHref()" target="_blank" rel="noopener noreferrer">open in a new tab ↗</a>.
+            </span>
+          </template>
+        </div>
+      </div>
+    </div>
+
+    <!-- ACTIONS (PORTHOLE) -->
+    <div class="card" x-show="step==='actions_porthole'">
+      <div class="title mb-10">Actions — Porthole</div>
+
+      <div class="card mb-12">
+        <div class="xs muted mb-6">Selected Porthole</div>
+        <div class="row space">
+          <div class="rowitem flex1">
+            <div>🖥️</div>
+            <div class="grow">
+              <div class="title f15" x-text="porthole? (porthole.alias||'Porthole') : '—'"></div>
+              <div class="xs muted mono">
+                <span x-text="porthole? (porthole.ip) : '—'"></span>
+                <span> · Port: </span><span x-text="castPort"></span>
+              </div>
+            </div>
+          </div>
+          <div class="ml-8">
+            <label class="xs muted block mb-6">Port</label>
+            <select class="select mini"
+                    :value="castPort"
+                    @change="setCastPort(Number($event.target.value))">
+              <template x-for="p in portOptions()" :key="`p2-${p}`">
+                <option :value="Number(p)" x-text="p"></option>
+              </template>
+            </select>
+          </div>
+        </div>
+      </div>
+
+      <div class="row gap-10 mb-12">
+        <button class="btn" @click="doRequestFor('porthole')">⟳ Load current</button>
+      </div>
+
+      <template x-if="autoControlsGrouped(activeAccept('porthole')).ranges.length===0
+                   && autoControlsGrouped(activeAccept('porthole')).selects.length===0
+                   && autoControlsGrouped(activeAccept('porthole')).toggles.length===0">
+        <div class="xs muted">No auto-controls yet for this porthole. Try “Load current”.</div>
+      </template>
+
+      <div class="list mt-12">
+        <!-- sliders -->
+        <template x-for="ctrl in autoControlsGrouped(activeAccept('porthole')).ranges" :key="`rngP:${ctrl.path}`">
+          <div>
+            <div class="xs muted mb-6" x-text="`(P) ` + prettyLabel(ctrl.label)"></div>
+            <div class="row space mb-6">
+              <div class="xs muted" x-text="String(ctrl.min)"></div>
+              <div class="mono chip" x-text="paramGet(ctrl.path)"></div>
+            </div>
+            <input type="range" class="slider"
+                   :min="ctrl.min" :max="ctrl.max" :step="ctrl.step||1"
+                   :value="paramGet(ctrl.path)"
+                   @input="onRange(ctrl.path, $event.target.value, 'porthole')">
+          </div>
+        </template>
+
+        <!-- selects -->
+        <template x-for="ctrl in autoControlsGrouped(activeAccept('porthole')).selects" :key="`selP:${ctrl.path}`">
+          <label>
+            <div class="xs muted mb-6" x-text="`(P) ` + prettyLabel(ctrl.label)"></div>
+            <select class="select"
+                    :value="String(paramGet(ctrl.path))"
+                    @change="onSelect(ctrl.path, $event.target.value, 'porthole')">
+              <template x-for="opt in ctrl.options" :key="`optP:${ctrl.path}:${String(opt)}`">
+                <option :value="String(opt)" x-text="String(opt)"></option>
+              </template>
+            </select>
+          </label>
+        </template>
+
+        <!-- toggles -->
+        <template x-for="ctrl in autoControlsGrouped(activeAccept('porthole')).toggles" :key="`tglP:${ctrl.path}`">
+          <div class="row space rowitem pad-10">
+            <div class="xs muted" x-text="`(P) ` + prettyLabel(ctrl.label)"></div>
+            <label class="switch">
+              <input type="checkbox"
+                     :checked="!!paramGet(ctrl.path)"
+                     @change="onToggle(ctrl.path,$event.target.checked,'porthole')">
+              <span class="track"></span>
+            </label>
+          </div>
+        </template>
+      </div>
+    </div>
+
+    <!-- ACTIONS (RELAY) -->
+    <div class="card" x-show="step==='actions_relay'">
+      <div class="title mb-10">Actions — Relay</div>
+
+      <div class="card mb-12">
+        <div class="xs muted mb-6">Selected Relay</div>
+        <div class="rowitem">
+          <div>🔀</div>
+          <div class="grow">
+            <div class="title f15" x-text="relay? (relay.alias||'Relay') : '—'"></div>
+            <div class="xs muted mono" x-text="relay? (relay.ip) : '—'"></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="row gap-10 mb-12">
+        <button class="btn" @click="doRequestFor('relay')">⟳ Load current</button>
+      </div>
+
+      <template x-if="autoControlsGrouped(activeAccept('relay')).ranges.length===0
+                   && autoControlsGrouped(activeAccept('relay')).selects.length===0
+                   && autoControlsGrouped(activeAccept('relay')).toggles.length===0">
+        <div class="xs muted">No auto-controls yet for this relay. Try “Load current”.</div>
+      </template>
+
+      <div class="list mt-12">
+        <!-- sliders -->
+        <template x-for="ctrl in autoControlsGrouped(activeAccept('relay')).ranges" :key="`rngR:${ctrl.path}`">
+          <div>
+            <div class="xs muted mb-6" x-text="`(R) ` + prettyLabel(ctrl.label)"></div>
+            <div class="row space mb-6">
+              <div class="xs muted" x-text="String(ctrl.min)"></div>
+              <div class="mono chip" x-text="paramGet(ctrl.path)"></div>
+            </div>
+            <input type="range" class="slider"
+                   :min="ctrl.min" :max="ctrl.max" :step="ctrl.step||1"
+                   :value="paramGet(ctrl.path)"
+                   @input="onRange(ctrl.path, $event.target.value, 'relay')">
+          </div>
+        </template>
+
+        <!-- selects -->
+        <template x-for="ctrl in autoControlsGrouped(activeAccept('relay')).selects" :key="`selR:${ctrl.path}`">
+          <label>
+            <div class="xs muted mb-6" x-text="`(R) ` + prettyLabel(ctrl.label)"></div>
+            <select class="select"
+                    :value="String(paramGet(ctrl.path))"
+                    @change="onSelect(ctrl.path, $event.target.value, 'relay')">
+              <template x-for="opt in ctrl.options" :key="`optR:${ctrl.path}:${String(opt)}`">
+                <option :value="String(opt)" x-text="String(opt)"></option>
+              </template>
+            </select>
+          </label>
+        </template>
+
+        <!-- toggles -->
+        <template x-for="ctrl in autoControlsGrouped(activeAccept('relay')).toggles" :key="`tglR:${ctrl.path}`">
+          <div class="row space rowitem pad-10">
+            <div class="xs muted" x-text="`(R) ` + prettyLabel(ctrl.label)"></div>
+            <label class="switch">
+              <input type="checkbox"
+                     :checked="!!paramGet(ctrl.path)"
+                     @change="onToggle(ctrl.path,$event.target.checked,'relay')">
+              <span class="track"></span>
+            </label>
+          </div>
+        </template>
+      </div>
+    </div>
+
+    <!-- Counts (always visible) -->
+    <div class="grid-3 mt-18">
+      <div class="card center"><div class="xs muted">Beacons</div><div class="title" x-text="beacons.length"></div></div>
+      <div class="card center"><div class="xs muted">Portholes</div><div class="title" x-text="portholes.length"></div></div>
+      <div class="card center"><div class="xs muted">Relays</div><div class="title" x-text="relays.length"></div></div>
+    </div>
+
+    <!-- Event log (always visible) -->
+    <div class="mt-18">
+      <div class="row space mb-6">
+        <div class="title">Event log</div>
+        <div class="xs muted">
+          <button class="btn small" @click="logExpanded = !logExpanded" x-text="logExpanded ? 'Show less' : 'Show more'"></button>
+        </div>
+      </div>
+      <div class="log" id="log">
+        <template x-for="e in (logExpanded ? eventLog.slice(0,10) : eventLog.slice(0,3))" :key="e.k">
+          <div>
+            <span class="mono xs" x-text="e.t"></span>
+            <span class="xs" :style="{color: e.c}">[<span x-text="e.knd"></span>]</span>
+            <span class="xs" x-text="e.msg"></span>
+          </div>
+        </template>
+      </div>
+    </div>
+  </div>
+
+  <!-- Settings -->
+  <dialog id="dlg">
+    <div class="row space dlg-hdr">
+      <div class="title">Connection</div>
+      <button class="btn" onclick="document.getElementById('dlg').close()">Close</button>
+    </div>
+    <div class="dlg-body">
+      <label class="col gap-6 mb-10">
+        <div class="xs muted">Wayfinder WS URL</div>
+        <input x-model="wsUrl" class="select mono bg-dark" />
+      </label>
+
+      <div class="card my-10">
+        <div class="title f14 mb-6">Find Wayfinder (browser scan)</div>
+        <div class="xs muted mb-6">
+          Probes <span class="mono">http://IP:8089/health</span> across your /24 (1–254) and lists WS base URLs.
+        </div>
+
+        <div class="row gap-8 mb-8">
+          <input x-model="scanPrefix" placeholder="192.168.2" class="select mono bg-dark flex1" />
+          <button class="btn" :disabled="isScanning" @click="scanSubnet()" x-text="isScanning ? 'Scanning…' : 'Scan /24'"></button>
+        </div>
+
+        <div class="row space xs muted" x-show="isScanning || scanDone" style="margin:6px 0">
+          <div>
+            <span x-text="`Progress: ${scanPercent}% (${scanned}/${scanTotal})`"></span>
+          </div>
+          <div><span x-text="`Found: ${scanFound.length}`"></span></div>
+        </div>
+        <div class="pbar" x-show="isScanning || scanDone"><div :style="`width:${scanPercent}%`"></div></div>
+
+        <div class="list" x-show="scanFound.length" style="margin-top:10px">
+          <template x-for="w in scanFound" :key="w.url">
+            <button class="rowitem" @click="wsUrl=w.url; saveSettings()">
+              <div>🛰️</div>
+              <div class="grow">
+                <div class="title f14" x-text="w.url"></div>
+                <div class="xs muted" x-text="w.note || 'OK'"></div>
+              </div>
+              <div class="muted">Use</div>
+            </button>
+          </template>
+        </div>
+        <div class="xs muted" x-show="!scanFound.length && scanDone">No /health endpoints found.</div>
+      </div>
+
+      <label class="col gap-6">
+        <div class="xs muted">MJPEG path (for preview)</div>
+        <input x-model="mjpeg" class="select mono bg-dark" />
+      </label>
+
+      <div class="row space mt-12">
+        <button class="btn" @click="saveSettings()">Save</button>
+        <button class="btn grad" @click="reconnect()">Reconnect</button>
+      </div>
+    </div>
+  </dialog>
+</body>
+</html>
