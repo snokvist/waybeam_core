@@ -1,0 +1,68 @@
+{
+  "v": 1,
+  "id": "c88f…",                 // optional for matching req/resp
+  "kind": "cmd|event|ack|err",
+  "topic": "hail|presence|beam|stats|constellation",
+  "action": "request|update|cast|stop|save|load",
+  "data": { }
+}
+
+
+Presence (Core → UI)
+{
+  "v":1,"kind":"event","topic":"presence","action":"update",
+  "data":{
+    "devices":[
+      {"id":"beacon:AA:BB:CC:DD","name":"Garage-Cam","role":["beacon"],
+       "addr":{"ip":"192.168.0.101","http":"http://192.168.0.101"},
+       "lanes":["udp","rtsp","srt"],"caps":{"codec":["h264"],"max_kbps":20000}},
+      {"id":"relay:RPi-01","name":"Starport-01","role":["relay"],
+       "addr":{"ip":"192.168.0.1","http":"http://192.168.0.1"},
+       "lanes":["udp","srt"]},
+      {"id":"porthole:TV-LR","name":"Porthole","role":["porthole"],
+       "addr":{"ip":"192.168.0.50","http":"http://192.168.0.50"}}
+    ],
+    "ttl": 10
+  }
+}
+
+
+
+
+Cast / Stop (UI → Core)
+{"v":1,"id":"cmd-123","kind":"cmd","topic":"beam","action":"cast",
+ "data":{"from":"beacon:AA:BB","via":"relay:RPi-01","to":"porthole:TV-LR",
+         "lane":"udp","params":{"bitrate_kbps":12000,"mtu":1400}}}
+
+{"v":1,"id":"cmd-124","kind":"cmd","topic":"beam","action":"stop",
+ "data":{"beam_id":"beam-7f32"}}
+
+ Beam state (Core → UI)
+{"v":1,"kind":"event","topic":"beam","action":"update",
+ "data":{"id":"beam-7f32","from":"beacon:AA:BB","via":"relay:RPi-01","to":"porthole:TV-LR",
+         "lane":"udp","state":"connecting|connected|error|stopped",
+         "stats":{"kbps":11800,"fps":60}}}
+
+
+Last full JSON (264 bytes):
+{"hail":{"v":1,"type":"ANNOUNCE","msg_id":"d3bcdd64-d9c0fea3","correl_id":null,"src_id":"8d47c798e86a1a1b","ip":"0.0.0.0","port":47929,"ts":1755989972,"hop":0,"ttl":0,"pref_unicast":true,"max_app_bytes":1024,"expires_in":12,"relay_ok":true},"app":{"demo":"ready"}}
+
+
+Last hail{} slice (230 bytes):
+{"v":1,"type":"BEACON","msg_id":"df9b40c0-a46ba649","correl_id":null,"src_id":"8d47c798e86a1a1b","ip":"0.0.0.0","port":47929,"ts":1755989975,"hop":0,"ttl":0,"pref_unicast":true,"max_app_bytes":1024,"expires_in":12,"relay_ok":true}
+
+Last full JSON (264 bytes):
+{"hail":{"v":1,"type":"DATA","msg_id":"684db515-b16e8459","correl_id":null,"src_id":"2fb2c76644f98b72","ip":"0.0.0.0","port":47929,"ts":1755990305,"hop":0,"ttl":2,"pref_unicast":true,"max_app_bytes":1024,"expires_in":12,"relay_ok":true},"app":{"demo":"broadcast"}}
+
+
+make mipsel-openwrt OPENWRT_MIPSEL_BIN=$HOME/fpv/openwrt/staging_dir/toolchain-mipsel_24kc_gcc-13.3.0_musl/bin
+
+scp -O build/arm-gnu/hail_demo_cli root@192.168.2.202:/usr/bin
+scp -O build/arm-musl/hail_demo_cli root@192.168.2.201:/usr/bin
+scp -O build/aarch64-gnu/hail_demo_cli root@192.168.2.20:/usr/bin
+scp -O build/mipsel-openwrt/hail_demo_cli root@192.168.2.1:/usr/bin
+
+
+
+wscat -c ws://192.168.2.1:8089/ -x '{"op":"beacon"}'
+wscat -c ws://192.168.2.1:8089/ -x '{"op":"nodes"}'
