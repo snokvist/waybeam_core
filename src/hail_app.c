@@ -794,12 +794,34 @@ static int handle_beacon_beam_request(hail_ctx* h,
                                       const app_msg_t_local* msg,
                                       char* json_out, size_t json_out_sz)
 {
-  (void)h; (void)meta; (void)from; (void)rt; (void)msg;
+  (void)h; (void)meta; (void)from; (void)rt;
   if(!cfg->beacon_exec_beam_request[0]) return APP_NO_PATH;
+
+  /* Only enhancement: pass optional data.mask to child as HAIL_MASK */
+  if (msg && msg->data_json && msg->data_json[0]) {
+    char *mask_raw = NULL;
+    /* Try to grab any JSON value at top-level key "mask" (object/array/string/number) */
+    if (top_level_copy_field(msg->data_json, "mask", &mask_raw) == 0 && mask_raw) {
+      setenv("HAIL_MASK", mask_raw, 1);
+      free(mask_raw);
+    } else {
+      /* Fallback: if it's a plain string, our small jf_str() can fetch it */
+      char mask_str[256] = "";
+      if (jf_str(msg->data_json, "mask", mask_str, sizeof mask_str)) {
+        setenv("HAIL_MASK", mask_str, 1);
+      } else {
+        /* No mask provided — avoid leaking a stale value into the tool */
+        unsetenv("HAIL_MASK");
+      }
+    }
+  } else {
+    unsetenv("HAIL_MASK");
+  }
 
   if(getenv("APP_DEBUG")){
     fprintf(stderr,"[APP-DEBUG] REQUEST tool: %s\n", cfg->beacon_exec_beam_request);
   }
+
   json_out[0]=0;
   return run_cmd_capture(cfg->beacon_exec_beam_request, json_out, json_out_sz);
 }

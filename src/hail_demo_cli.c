@@ -1,5 +1,5 @@
-// waybeam_core.c — line-oriented Waybeam Core for Hail v1 (no ncurses)
-// Build: gcc -O2 -Wall -Wextra -std=c11 waybeam_core.c -L. -lhail -lpthread -o waybeam_core
+// hail_demo_cli.c — line-oriented CLI demo for Hail v1 (no ncurses)
+// Build: gcc -O2 -Wall -Wextra -std=c11 hail_demo_cli.c -L. -lhail -lpthread -o hail_demo_cli
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -522,22 +522,16 @@ static void on_msg(hail_ctx *ctx, const hail_meta_t *m,
     struct in_addr a; a.s_addr = m->src_ip;
     snprintf(ipbuf,sizeof ipbuf,"%s", inet_ntoa(a));
 
-    //char app_esc[512];
-    //escape_bytes_for_log(appjson, alen, app_esc, sizeof app_esc, 256);
-    (void)app_handle_rx(ctx, m, appjson, alen, from, &g_mods, &g_rt);
-
-     LOGF("[RX] %s from %s:%u id=%s hop=%d ttl=%d sig=%s | app=%.*s\n",
-     m->type, ipbuf, m->src_port, m->msg_id,
-     m->hop, m->ttl, (m->signed_ok?"OK":(m->signed_present?"BAD":"none")),
-     (int)alen, appjson);
+    char app_esc[512];
+    escape_bytes_for_log(appjson, alen, app_esc, sizeof app_esc, 256);
 
     /* App dispatch (single call) */
     (void)app_handle_rx(ctx, m, appjson, alen, from, &g_mods, &g_rt);
 
-    //LOGF("[RX] %s from %s:%u id=%s hop=%d ttl=%d sig=%s | app=%s\n",
-    //     m->type, ipbuf, m->src_port, m->msg_id,
-    //     m->hop, m->ttl, (m->signed_ok?"OK":(m->signed_present?"BAD":"none")),
-    //     app_esc);
+    LOGF("[RX] %s from %s:%u id=%s hop=%d ttl=%d sig=%s | app=%s\n",
+         m->type, ipbuf, m->src_port, m->msg_id,
+         m->hop, m->ttl, (m->signed_ok?"OK":(m->signed_present?"BAD":"none")),
+         app_esc);
 
     if (g_verbose_rx && (!strcmp(m->type,"BEACON") || !strcmp(m->type,"ANNOUNCE"))) {
         dump_hail_props(ctx, from, m->type);
@@ -554,7 +548,7 @@ static void on_msg(hail_ctx *ctx, const hail_meta_t *m,
             (void)jf_str(appjson,"state",state,sizeof state);
             (void)jf_str(appjson,"code",code,sizeof code);
         }
-        LOGF("[WAYBEAM-ACK] id=%s topic=%s action=%s state=%s code=%s\n",
+        LOGF("[APP-ACK] id=%s topic=%s action=%s state=%s code=%s\n",
              id[0]?id:"", topic[0]?topic:"", action[0]?action:"",
              state[0]?state:"", code[0]?code:"");
     }
@@ -761,7 +755,7 @@ int has_constellation = roles_has(cfg.roles, "constellation");
 
 /* Running config banner (ALWAYS visible) */
 fprintf(stderr,
-    "=== Waybeam Core: running config ===\n"
+    "=== Hail Demo CLI: running config ===\n"
     "[RUN] bind=%s:%u  declared_ip=%s  alias=%s\n"
     "[RUN] roles=%s  caps=%s\n"
     "[RUN] pref_unicast=%s  max_app_bytes=%s  relay_ok=%s\n"
@@ -785,7 +779,7 @@ fprintf(stderr,
 
 if (has_beacon){
     fprintf(stderr,
-        "[WAYBEAM.beacon]\n"
+        "[APP.beacon]\n"
         "  cast   : %s\n"
         "  update : %s\n"
         "  request: %s\n"
@@ -803,7 +797,7 @@ if (has_beacon){
 
 if (has_relay){
     fprintf(stderr,
-        "[WAYBEAM.relay]\n"
+        "[APP.relay]\n"
         "  start  : %s\n"
         "  update : %s\n"
         "  stop   : %s\n"
@@ -819,7 +813,7 @@ if (has_relay){
 
 if (has_porthole){
     fprintf(stderr,
-        "[WAYBEAM.porthole]\n"
+        "[APP.porthole]\n"
         "  update : %s\n"
         "  stop   : %s\n"
         "  control: %s\n"
@@ -835,14 +829,14 @@ if (has_porthole){
 
 if (has_constellation){
     fprintf(stderr,
-        "[WAYBEAM.constellation]\n"
+        "[APP.constellation]\n"
         "  sync   : %s\n",
         (cfg.constellation_exec_sync[0]? cfg.constellation_exec_sync : "(unset)")
     );
 }
 
 /* Banner + optional initial announce */
-printf("Waybeam Core  %s  (bound %s:%u)\n", hail_version(), bind_ip, effective_port);
+printf("Hail Demo CLI  %s  (bound %s:%u)\n", hail_version(), bind_ip, effective_port);
     usage_line();
     if(cfg.announce_json[0]){ hail_send_announce(h, cfg.announce_json); }
 
@@ -891,7 +885,7 @@ printf("Waybeam Core  %s  (bound %s:%u)\n", hail_version(), bind_ip, effective_p
             }
 
             else if (cmd=='d'){
-                int ttl = 2; const char *json = "{\"waybeam_core\":\"broadcast\"}";
+                int ttl = 2; const char *json = "{\"demo\":\"broadcast\"}";
                 if (strlen(line)>2){
                     char *p=line+2; while(*p==' ') p++;
                     if (*p){
