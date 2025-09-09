@@ -302,10 +302,10 @@
         <label>
           <div class="xs muted mb-6">FPS</div>
           <select class="select"
-                  :value="params.video0.fps"
-                  @change="onSelect('video0.fps',Number($event.target.value),'beacon')">
-            <template x-for="opt in listGet('video0.fps',[10,30,60,90,120])" :key="`fps-${opt}`">
-              <option :value="Number(opt)" x-text="opt"></option>
+                  :value="String(params.video0.fps)"
+                  @change="onSelect('video0.fps', Number($event.target.value), 'beacon')">
+            <template x-for="opt in listGet('video0.fps',[10,30,60,90,120])" :key="`fps-${String(opt)}`">
+              <option :value="String(opt)" x-text="String(opt)"></option>
             </template>
           </select>
         </label>
@@ -335,10 +335,10 @@
         <label>
           <div class="xs muted mb-6">GOP Size</div>
           <select class="select"
-                  :value="params.video0.gopSize"
-                  @change="onSelect('video0.gopSize',Number($event.target.value),'beacon')">
-            <template x-for="opt in listGet('video0.gopSize',[0.25,0.5,0.75,1,2,3,5,10])" :key="`gop-${opt}`">
-              <option :value="Number(opt)" x-text="opt"></option>
+                  :value="String(params.video0.gopSize)"
+                  @change="onSelect('video0.gopSize', Number($event.target.value), 'beacon')">
+            <template x-for="opt in listGet('video0.gopSize',[0.25,0.5,0.75,1,2,3,5,10])" :key="`gop-${String(opt)}`">
+              <option :value="String(opt)" x-text="String(opt)"></option>
             </template>
           </select>
         </label>

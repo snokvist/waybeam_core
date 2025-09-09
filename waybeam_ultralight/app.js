@@ -402,6 +402,35 @@ window.app = function app(){
       return obj;
     },
 
+// Return array of static control paths (always exposed in UI)
+staticParamPaths(){
+  // mirrors the static controls shown in UI; exclude 'lane'
+  return Array.from(this.autoSkipKeys).filter(k => k !== 'lane');
+},
+
+// Return list of param paths currently exposed (statics + visible autos)
+exposedParamPaths(role='beacon'){
+  const statics = this.staticParamPaths();
+
+  // Only auto-controls that are currently visible (i.e. have a value)
+  const grouped = this.autoControlsGrouped(this.activeAccept(role));
+  const autos = [
+    ...grouped.ranges.map(c => c.path),
+    ...grouped.selects.map(c => c.path),
+    ...grouped.toggles.map(c => c.path),
+  ];
+
+  // de-dup
+  return Array.from(new Set([...statics, ...autos]));
+},
+
+// Build a sparse "mask" object from paths, with null values (backend treats as “refresh these”)
+buildParamsMaskFromPaths(paths){
+  const mask = {};
+  for(const p of (paths||[])){ this.pathSet(mask, p, null); }
+  return mask;
+},
+
     nodeForRole(role){
       if(role==='beacon') return this.beacon;
       if(role==='porthole') return this.porthole;
@@ -472,7 +501,22 @@ buildUpdate(){
     }
   };
 },
-    buildRequest(){ return { v:1, id:this.genId(), kind:'cmd', topic:'beam', action:'request', data:{} }; },
+buildRequest(role='beacon'){
+  const paths = this.exposedParamPaths(role);      // statics + visible autos
+  if(paths.length===0){
+    // fall back to classic empty request → backend returns full params
+    return { v:1, id:this.genId(), kind:'cmd', topic:'beam', action:'request', data:{} };
+  }
+  // Send a compact path mask to save bytes; backend replies with data.params
+  return {
+    v:1, id:this.genId(), kind:'cmd', topic:'beam', action:'request',
+    data:{
+      lane: this.params.lane || 'Default',
+      mask: paths,                   // << array of "a.b.c" paths
+      requestMode: 'maskPaths'       // optional hint for backend
+    }
+  };
+},
 
     doCast(){
       if(!this.beacon){ this.log('err','Pick a Beacon first'); return; }
@@ -500,7 +544,7 @@ buildUpdate(){
       else if(role==='porthole') node = this.porthole;
       else if(role==='relay') node = this.relay;
       if(!node){ if(!silent) this.log('err',`Pick a ${role} first`); return; }
-      const app = this.buildRequest();
+      const app = this.buildRequest(role);
       this.unicast(`${node.ip}:${node.port}`, { app });
       this.stats.tx++; if(!silent) this.log('tx',`${role}.request current`,'#b3ecff');
     },
