@@ -1,9 +1,17 @@
 /*
- * UDP Relay Manager — single epoll loop + tiny HTTP /api/v1 + INI in /etc
+ * UDP Relay Manager — single epoll loop + tiny HTTP /api/v1 + /ui
  * -----------------------------------------------------------------------
+ * Additions in this build:
+ *  - /ui and /ui.js: mobile-friendly drag/tap UI with green/blue/yellow lanes
+ *  - POST /api/v1/action/clear_to: remove exactly one dest from one bind atomically
+ *  - Status JSON now includes pkts_out_total (sum of per-dest pkts)
+ *  - Safe counter roll-over: halves counters once thresholds are exceeded
+ *  - Fixed HTTP state handling (hc_find so UDP fds don't get misclassified)
+ *  - UI/JS patches: keep selection across refresh; robust DnD; JSON Content-Type header
+ *
  * House Rules implemented:
  *  1) One hot path loop (epoll). All sockets O_NONBLOCK.
- *  2) No frameworks; tiny HTTP server for /api/v1/*.
+ *  2) No frameworks; tiny HTTP server for /api/v1/* and /ui.
  *  3) Signals:
  *       - SIGHUP  -> re-read /etc/udp_relay.conf and apply (hot reload)
  *       - SIGINT/SIGTERM -> graceful exit
@@ -12,12 +20,9 @@
  *       GET  /api/v1/status        -> JSON status (≤ 8 KiB)
  *       GET  /api/v1/config        -> returns INI text
  *       POST /api/v1/config        -> replace INI text; apply & persist
- *       POST /api/v1/action/<verb> -> verbs: set, append, append_range, clear, reset
- *     Added:
- *       GET  /ui                   -> embedded Web UI (same-origin)
- *       GET  /ui.js                -> UI logic
- *       GET  /                     -> 302 → /ui
- *       OPTIONS *                  -> CORS preflight
+ *       POST /api/v1/action/<verb> -> verbs: set, append, append_range, clear, reset, clear_to
+ *       GET  /ui                   -> HTML UI
+ *       GET  /ui.js                -> UI javascript
  *
  * Build:
  *   gcc -O2 -Wall -Wextra -std=gnu11 -o udp_relay_manager udp_relay_manager.c
@@ -25,24 +30,25 @@
  * Runtime:
  *   ./udp_relay_manager   (no arguments)
  *
- * Config file: /etc/udp_relay.conf   (no --config flag by design)
+ * Config file: /etc/udp_relay.conf
  *
  * INI format (no sections; '#' or ';' are comments):
- *   # HTTP bind + control port
  *   http_bind=127.0.0.1
  *   control_port=9000
- *
- *   # UDP listener defaults
  *   src_ip=0.0.0.0
  *   rcvbuf=1048576
  *   sndbuf=1048576
  *   bufsz=9000
  *   tos=0
+ *   bind=5700:5600
+ *   bind=5701
+ *   bind=5702
+ *   bind=5703
  *
- *   # One or more binds: bind=<SRC>[:<DST_LIST>]
- *   # DST token forms: "port" | "ip:port" | "start-end" | "ip:start-end"
- *   bind=5801:9000,9001,7000-7002,192.168.0.10:7500
- *   bind=5802
+ * UI-only metadata (optional):
+ *   dest_green=127.0.0.1:5600            # one-to-one "video"
+ *   dest_blue=192.168.2.20:14550         # many-to-one "mavlink"
+ *   dest_yellow=10.0.0.11:5600           # one-to-many "split"
  */
 
 #define _GNU_SOURCE
@@ -74,10 +80,14 @@
 #define MAX_LINE        1024
 #define MAX_EVENTS      128
 #define MAX_HTTP_CONN   64
-#define HTTP_BUF_MAX    65536         /* max request buffer; config POST can be big */
-#define STATUS_CAP      8192          /* soft cap for status JSON payload */
+#define HTTP_BUF_MAX    65536
+#define STATUS_CAP      8192
 #define CFG_PATH        "/etc/udp_relay.conf"
 #define CFG_TMP_PATH    "/etc/udp_relay.conf.tmp"
+
+/* Counter roll-over thresholds: when any hits these, all are halved */
+#define PKTS_ROLLOVER_LIMIT  ((uint64_t)1000000000ULL)  /* 1e9 pkts */
+#define BYTES_ROLLOVER_LIMIT ((uint64_t)1ULL<<40)       /* ~1 TiB  */
 
 /* ------------------- small utils ---------------------------- */
 
@@ -107,202 +117,6 @@ static int set_nonblock(int fd){
     int fl = fcntl(fd, F_GETFL, 0);
     if (fl<0) return -1;
     return fcntl(fd, F_SETFL, fl | O_NONBLOCK);
-}
-
-/* ------------------- UI assets + CORS helpers ---------------- */
-
-/* Embedded UI HTML (served at /ui) */
-static const char UI_HTML[] =
-"<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"/>"
-"<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"/>"
-"<title>UDP Relay Manager · WebUI</title>"
-"<style>"
-":root{--bg:#0f1116;--panel:#151823;--muted:#8a93a5;--text:#e8ecf1;--accent:#7bd389;--warn:#e7b75f;--err:#ff7a7a}"
-"*{box-sizing:border-box}body{margin:0;font:14px/1.4 system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:var(--bg);color:var(--text)}"
-"header{display:flex;gap:.75rem;flex-wrap:wrap;align-items:center;padding:12px 16px;background:#0c0f17;position:sticky;top:0;z-index:2;border-bottom:1px solid #1e2231}"
-"h1{font-size:16px;margin:0 auto 0 0;letter-spacing:.2px}.row{display:flex;gap:.5rem;align-items:center}"
-"label{font-size:12px;color:var(--muted)}input,button,textarea,select{background:var(--panel);color:var(--text);border:1px solid #242b3d;border-radius:10px;padding:8px 10px;outline:0}"
-"input,select{height:36px}button{cursor:pointer}button.primary{background:linear-gradient(180deg,#1f6b43,#165538);border-color:#1f6b43}"
-"button.ghost{background:transparent;border-color:#2a3247}button.warn{background:#3b2e13;border-color:#5c4723;color:#ffd990}"
-"main{max-width:1200px;margin:16px auto;padding:0 16px;display:grid;grid-template-columns:1.1fr .9fr;gap:16px}"
-"section{background:var(--panel);border:1px solid #20273a;border-radius:16px;overflow:hidden}"
-"section h2{margin:0;padding:10px 12px;border-bottom:1px solid #20273a;font-size:13px;color:#aab3c7;background:#121626;letter-spacing:.3px}"
-".pad{padding:12px}.chips{display:flex;flex-wrap:wrap;gap:8px}.chip{border:1px dashed #2a3247;border-radius:20px;padding:6px 10px;display:flex;gap:8px;align-items:center;user-select:none}"
-".chip[draggable=true]{cursor:grab}.chip .tag{opacity:.65;font-size:12px}"
-".grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px}"
-".dest{min-height:84px;border:2px dashed #2b344d;border-radius:14px;display:flex;align-items:center;justify-content:center;gap:10px;padding:12px;transition:.15s}"
-".dest.drag-over{border-color:var(--accent);background:#0f1a14}"
-".muted{color:var(--muted)}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,\"Liberation Mono\",monospace}"
-".rowline{display:flex;justify-content:space-between;gap:6px;border:1px solid #252d40;border-radius:10px;padding:8px 10px;margin-bottom:8px}"
-"textarea.ini{width:100%;min-height:220px;resize:vertical}.log{height:140px;overflow:auto;background:#0c0f17;border:1px solid #1e2231;border-radius:10px;padding:8px}"
-".ok{color:var(--accent)}.warn{color:var(--warn)}.err{color:var(--err)}"
-"</style></head><body>"
-"<header>"
-"<h1>UDP Relay Manager · WebUI</h1>"
-"<button class='primary' id='refresh'>Refresh</button>"
-"</header>"
-"<main>"
-"<section><h2>Destinations — drag binds onto a box</h2>"
-"<div class='pad'>"
-"<div class='chips' id='bindChips'></div>"
-"<div id='destGrid' class='grid' style='margin-top:12px'></div>"
-"<div id='adhocBox' style='margin-top:12px;display:none'>"
-"  <div class='row' style='gap:8px;margin-bottom:8px'>"
-"    <label>Ad-hoc receiver</label>"
-"    <input id='rxHost' value='127.0.0.1' style='width:160px'/>"
-"    <label>port</label>"
-"    <input id='rxPort' value='5600' style='width:100px'/>"
-"  </div>"
-"  <div id='adhocDrop' class='dest'><div>"
-"    <div class='muted'>Drop a bind here to route it to</div>"
-"    <div class='mono' id='rxLabel'>127.0.0.1:5600</div>"
-"  </div></div>"
-"  <div style='margin-top:8px' class='muted'>Ad-hoc: clears only previously mapped binds pointing to this exact destination.</div>"
-"</div>"
-"</div>"
-"</section>"
-
-"<section><h2>Live Status</h2><div class='pad' id='statusBox'><div class='muted'>Loading…</div></div></section>"
-
-"<section><h2>Destinations (add/remove & persist)</h2>"
-"<div class='pad'>"
-"  <div id='destList'></div>"
-"  <div class='row' style='gap:8px;margin-top:8px'>"
-"    <input id='newDestHost' placeholder='host (e.g. 127.0.0.1)' style='width:200px'/>"
-"    <input id='newDestPort' placeholder='port (e.g. 5600)' style='width:120px'/>"
-"    <button id='addDest'>Add destination</button>"
-"    <button class='warn' id='saveDests'>Save destinations</button>"
-"  </div>"
-"  <div style='margin-top:6px' class='muted'>Destinations are stored in <span class='mono'>/etc/udp_relay.conf</span> as <span class='mono'>dest=host:port</span> lines (or a single <span class='mono'>ui_destinations=</span> line). They’re for the UI only.</div>"
-"</div>"
-"</section>"
-
-"<section><h2>Binds & Config</h2><div class='pad'>"
-"  <div class='row' style='gap:8px;margin-bottom:8px'>"
-"    <input id='newBindPort' placeholder='e.g. 5700' style='width:140px'/>"
-"    <button id='addBind'>Add bind</button>"
-"    <button class='warn' id='applyCfg'>Apply config</button>"
-"  </div>"
-"  <div id='bindList' style='margin-bottom:10px'></div>"
-"  <label>Config (INI)</label>"
-"  <textarea id='cfgText' class='ini mono' spellcheck='false'></textarea>"
-"</div></section>"
-
-"<section><h2>Log</h2><div class='pad'><div id='log' class='log mono'></div></div></section>"
-"</main>"
-"<script src='/ui.js'></script>"
-"</body></html>";
-
-/* Embedded UI JS (served at /ui.js) */
-static const char UI_JS[] =
-"(function(){"
-"const $=s=>document.querySelector(s);"
-"const log=(m,c='')=>{const el=$('#log');const d=document.createElement('div');if(c)d.className=c;d.textContent=`[${new Date().toLocaleTimeString()}] ${m}`;el.prepend(d)};"
-"const state={status:null,ini:'',dests:[]};"
-"const GET=p=>fetch(p,{method:'GET'}).then(r=>{if(!r.ok)throw new Error(`${r.status} ${r.statusText}`);return p.includes('/status')?r.json():r.text()});"
-"const POST=(p,b)=>fetch(p,{method:'POST',body:b}).then(async r=>{if(!r.ok)throw new Error(`${r.status} ${r.statusText}`);try{return await r.json()}catch{return await r.text()}});"
-"const action=(v,o)=>POST(`/api/v1/action/${v}`,JSON.stringify(o||{}));"
-
-"/* -------- destinations model -------- */"
-"function normDest(s){s=String(s).trim();if(!s)return null;let host='127.0.0.1',port='';if(/^[0-9]+$/.test(s)){port=s;}else{const m=s.match(/^\\[?([A-Za-z0-9:._-]+)\\]?:([0-9]+)$/);if(!m)return null;host=m[1];port=m[2];}return `${host}:${port}`;}"
-"function parseDestinationsFromIni(txt){const dests=new Set();const lines=txt.split(/\\n/);for(const ln of lines){let m=ln.match(/^\\s*dest\\s*=\\s*(\\S+)/);if(m){const d=normDest(m[1]);if(d)dests.add(d);continue;}m=ln.match(/^\\s*ui_destinations\\s*=\\s*(.+)$/);if(m){for(const t of m[1].split(',')){const d=normDest(t);if(d)dests.add(d)}}}return Array.from(dests);} "
-"function writeDestinationsToIni(txt,destArr){/* remove old dest lines and ui_destinations line, then write dest= per item */"
-"  const out=[];const lines=txt.split(/\\n/);"
-"  for(const ln of lines){if(/^\\s*dest\\s*=/.test(ln)) continue; if(/^\\s*ui_destinations\\s*=/.test(ln)) continue; out.push(ln);} "
-"  if(out.length && out[out.length-1]!=='') out.push('');"
-"  for(const d of destArr){out.push(`dest=${d}`);} "
-"  return out.join('\\n');"
-"}"
-
-"/* -------- UI renderers -------- */"
-"function makeBindChip(port,stats){const el=document.createElement('div');el.className='chip';el.draggable=true;el.dataset.port=String(port);el.innerHTML=`<strong>bind ${port}</strong> <span class='tag'>in: ${stats.pkts_in||0}</span>`;el.addEventListener('dragstart',e=>{e.dataTransfer.setData('text/plain',String(port));e.dataTransfer.effectAllowed='copy'});return el}"
-"function renderBindChips(s){const wrap=$('#bindChips');wrap.innerHTML='';const rel=(s&&s.relays)?s.relays:[];for(const r of rel){wrap.appendChild(makeBindChip(r.port,r))}}"
-
-"function bindDropZone(el, destStr){el.addEventListener('dragover',e=>{e.preventDefault();el.classList.add('drag-over');e.dataTransfer.dropEffect='copy'});"
-"el.addEventListener('dragleave',()=>el.classList.remove('drag-over'));"
-"el.addEventListener('drop',async e=>{e.preventDefault();el.classList.remove('drag-over');const srcPort=parseInt(e.dataTransfer.getData('text/plain'),10);if(!srcPort)return;"
-" try{await rebindToDestination(srcPort,destStr);}catch(err){log(`Drop failed: ${err}`,'err')}});}"
-"function renderDestGrid(){const grid=$('#destGrid');grid.innerHTML='';const dests=state.dests; if(dests.length===0){$('#adhocBox').style.display='block';return;} $('#adhocBox').style.display='none';"
-" for(const d of dests){const card=document.createElement('div');card.className='dest';card.innerHTML=`<div><div class='muted'>Drop a bind to route →</div><div class='mono'>${d}</div></div>`;bindDropZone(card,d);grid.appendChild(card);} }"
-
-"function renderDestList(){const box=$('#destList');box.innerHTML='';if(!state.dests.length){box.innerHTML=\"<div class='muted'>No saved destinations. Use the fields below to add some.</div>\";return;} for(const d of state.dests){const row=document.createElement('div');row.className='rowline';row.innerHTML=`<div class='mono'>dest=${d}</div>`;const rm=document.createElement('button');rm.textContent='Remove';rm.onclick=()=>{state.dests=state.dests.filter(x=>x!==d);$('#cfgText').value=writeDestinationsToIni(state.ini,state.dests);renderDestList();renderDestGrid();};row.appendChild(rm);box.appendChild(row);} }"
-
-"/* -------- Status & config -------- */"
-"async function loadStatus(){try{const s=await GET('/api/v1/status');state.status=s;renderBindChips(s);renderStatus(s);}catch(err){$('#statusBox').innerHTML=`<span class='err'>Status error:</span> ${err}`}}"
-"function renderStatus(s){const box=$('#statusBox');if(!s||!Array.isArray(s.relays)){box.innerHTML='<div class=\"muted\">No relays</div>';return}const frag=document.createDocumentFragment();for(const r of s.relays){const line=document.createElement('div');line.className='rowline';const left=document.createElement('div');left.innerHTML=`<strong>bind ${r.port}</strong><div class='muted'>pkts_in ${r.pkts_in} · bytes_out ${r.bytes_out} · send_errs ${r.send_errs}</div>`;const right=document.createElement('div');const ip=document.createElement('input');ip.placeholder='ip (optional)';ip.style.width='160px';const port=document.createElement('input');port.placeholder='port';port.style.width='90px';const set=document.createElement('button');set.textContent='Set dest';set.onclick=async()=>{const d=port.value.trim();if(!d){log('Port required','warn');return}const host=(ip.value.trim()||'127.0.0.1');const token=`${host}:${d}`;try{await action('set',{port:r.port,dests:[token]});log(`bind ${r.port} → ${token}`,'ok');await loadStatus()}catch(err){log(`set failed: ${err}`,'err')}};const clr=document.createElement('button');clr.textContent='Clear';clr.onclick=async()=>{try{await action('clear',{port:r.port});log(`cleared ${r.port}`,'ok');await loadStatus()}catch(err){log(`clear failed: ${err}`,'err')}};right.appendChild(ip);right.appendChild(port);right.appendChild(set);right.appendChild(clr);const dests=document.createElement('div');dests.className='chips';dests.style.marginTop='6px';if(Array.isArray(r.dests)&&r.dests.length){for(const d of r.dests){const c=document.createElement('div');c.className='chip';c.innerHTML=`<span class='tag'>→</span><strong>${d.ip}:${d.port}</strong> <span class='tag'>pkts ${d.pkts}</span>`;dests.appendChild(c)}}else{const m=document.createElement('div');m.className='muted';m.textContent='no destinations';dests.appendChild(m)}line.appendChild(left);line.appendChild(right);frag.appendChild(line);frag.appendChild(dests)}box.innerHTML='';box.appendChild(frag)}"
-
-"async function loadConfig(){try{const t=await GET('/api/v1/config');state.ini=String(t||'').replace(/\\r/g,'');state.dests=parseDestinationsFromIni(state.ini);$('#cfgText').value=state.ini;renderBindListFromIni();renderDestList();renderDestGrid();maybeShowAdhoc();}catch(err){state.ini='';$('#cfgText').value='';$('#bindList').innerHTML=`<span class='err'>Config error:</span> ${err}`}}"
-
-"/* -------- Binds in INI -------- */"
-"function renderBindListFromIni(){const lines=state.ini.split(/\\n/);const binds=[];for(const ln of lines){const m=ln.match(/^\\s*bind\\s*=\\s*(\\d+)/);if(m)binds.push(parseInt(m[1],10))}const list=$('#bindList');list.innerHTML='';if(!binds.length){list.innerHTML='<div class=\"muted\">No binds in config.</div>';return}for(const p of binds){const row=document.createElement('div');row.className='rowline';row.innerHTML=`<div><strong class='mono'>bind=${p}</strong></div>`;const rm=document.createElement('button');rm.textContent='Remove';rm.onclick=()=>removeBindInIni(p);row.appendChild(rm);list.appendChild(row)}}"
-"function removeBindInIni(port){const before=state.ini.split(/\\n/);const after=before.filter(ln=>!ln.match(new RegExp(`^\\\\s*bind\\\\s*=\\\\s*${port}(\\\\b|:)`)));state.ini=after.join('\\n');$('#cfgText').value=state.ini;renderBindListFromIni()}"
-"function addBindInIni(port){const p=parseInt(port,10);if(!(p>0&&p<65536)){log('Invalid bind port','err');return}if(new RegExp(`^\\\\s*bind\\\\s*=\\\\s*${p}(\\\\b|:)`,'m').test(state.ini)){log(`bind ${p} already exists`,'warn');return}if(!/\\n$/.test(state.ini))state.ini+='\\n';state.ini+=`bind=${p}\\n`;$('#cfgText').value=state.ini;renderBindListFromIni()}"
-
-"/* -------- Destinations edit -------- */"
-"function maybeShowAdhoc(){const has=state.dests.length>0;$('#adhocBox').style.display=has?'none':'block';}"
-"$('#addDest').onclick=()=>{const h=($('#newDestHost').value.trim()||'127.0.0.1');const p=parseInt($('#newDestPort').value.trim(),10);if(!(p>0&&p<65536)){log('Invalid dest port','err');return}const d=`${h}:${p}`;if(!state.dests.includes(d)) state.dests.push(d);$('#cfgText').value=writeDestinationsToIni(state.ini,state.dests);renderDestList();renderDestGrid();maybeShowAdhoc();};"
-"$('#saveDests').onclick=async()=>{try{state.ini=$('#cfgText').value;await POST('/api/v1/config',state.ini);log('Destinations saved','ok');await refreshAll()}catch(err){log(`Save destinations failed: ${err}`,'err')}};"
-
-"/* -------- Ad-hoc drop (when no saved destinations) -------- */"
-"function rxSync(){const s=`${($('#rxHost').value.trim()||'127.0.0.1')}:${($('#rxPort').value.trim()||'5600')}`;$('#rxLabel').textContent=s;}"
-"$('#rxHost')&&$('#rxHost').addEventListener('input',rxSync);$('#rxPort')&&$('#rxPort').addEventListener('input',rxSync);"
-"function setupAdhoc(){const dz=$('#adhocDrop');if(!dz)return;bindDropZone(dz,()=>($('#rxHost').value.trim()||'127.0.0.1')+':' + ($('#rxPort').value.trim()||'5600'));rxSync();}"
-
-"/* -------- Core drop behavior: per-destination clear-then-set -------- */"
-"async function rebindToDestination(srcPort,dest){const destStr=(typeof dest==='function')?dest():String(dest);if(!/^[^:]+:[0-9]+$/.test(destStr)) throw new Error(`Bad destination: ${destStr}`);const rels=(state.status&&state.status.relays)?state.status.relays:[];"
-"  log(`Routing bind ${srcPort} → ${destStr} (clearing that destination on others first)…`);"
-"  /* Clear any binds currently forwarding to destStr */"
-"  for(const r of rels){if(Array.isArray(r.dests)&&r.dests.some(d=>`${d.ip}:${d.port}`===destStr)){await action('clear',{port:r.port});}}"
-"  /* Now set mapping for srcPort */"
-"  await action('set',{port:srcPort,dests:[destStr]});"
-"  log(`OK: ${srcPort} now → ${destStr}`,'ok');"
-"  await loadStatus();"
-"}"
-
-"/* -------- Wiring buttons -------- */"
-"$('#addBind').onclick=()=>addBindInIni($('#newBindPort').value.trim());"
-"$('#applyCfg').onclick=async()=>{try{await POST('/api/v1/config',$('#cfgText').value);log('Config applied & reloaded','ok');await refreshAll()}catch(err){log(`Apply failed: ${err}`,'err')}};"
-"$('#refresh').onclick=()=>refreshAll();"
-
-"/* -------- Boot -------- */"
-"async function refreshAll(){await Promise.all([loadStatus(),loadConfig()]);}"
-"setupAdhoc();refreshAll();setInterval(()=>loadStatus().catch(()=>{}),1500);"
-"})();";
-
-
-/* CORS-capable HTTP helpers */
-static void http_write(int fd, const char *buf, size_t n){ if(n) (void)send(fd, buf, n, 0); }
-static void http_printf(int fd, const char *fmt, ...){
-    char out[4096]; va_list ap; va_start(ap,fmt);
-    int n = vsnprintf(out, sizeof(out), fmt, ap);
-    va_end(ap);
-    if(n<0) return; if(n>(int)sizeof(out)) n=(int)sizeof(out);
-    http_write(fd, out, (size_t)n);
-}
-static void http_send_headers(int fd, const char *status_line, const char *ctype, ssize_t clen, const char *extra){
-    http_printf(fd, "%s\r\n", status_line);
-    if(ctype) http_printf(fd, "Content-Type: %s\r\n", ctype);
-    if(clen>=0) http_printf(fd, "Content-Length: %zd\r\n", clen);
-    http_printf(fd, "Connection: close\r\n");
-    /* CORS */
-    http_printf(fd, "Access-Control-Allow-Origin: *\r\n");
-    http_printf(fd, "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n");
-    http_printf(fd, "Access-Control-Allow-Headers: Content-Type\r\n");
-    http_printf(fd, "Cache-Control: no-store\r\n");
-    if(extra && *extra) http_printf(fd, "%s", extra);
-    http_printf(fd, "\r\n");
-}
-
-/* Legacy helper (kept for tiny responses) — always 200 text/plain with CORS */
-static void http_send(int fd, const char *fmt, ...){
-    char body[4096];
-    va_list ap; va_start(ap,fmt);
-    int n=vsnprintf(body,sizeof(body),fmt,ap);
-    va_end(ap);
-    if (n<0) return;
-    if (n > (int)sizeof(body)) n = (int)sizeof(body);
-    http_send_headers(fd, "HTTP/1.1 200 OK", "text/plain", n, NULL);
-    http_write(fd, body, (size_t)n);
 }
 
 /* ------------------- config model --------------------------- */
@@ -358,23 +172,19 @@ static int load_file(const char *path, char **out, size_t *outlen){
     if (sz<0) { fclose(fp); return -1; }
     char *buf=malloc((size_t)sz+1); if(!buf){ fclose(fp); return -1; }
     if ((long)fread(buf,1,(size_t)sz,fp)!=sz){ free(buf); fclose(fp); return -1; }
-    buf[sz]=0;
-    fclose(fp);
+    buf[sz]=0; fclose(fp);
     *out=buf; if(outlen)*outlen=(size_t)sz;
     return 0;
 }
 
 static int save_file_atomic(const char *path_tmp, const char *path, const char *data, size_t len){
-    int rc=-1;
-    FILE *fp=fopen(path_tmp,"wb");
-    if(!fp) return -1;
+    FILE *fp=fopen(path_tmp,"wb"); if(!fp) return -1;
     if (fwrite(data,1,len,fp)!=len){ fclose(fp); return -1; }
     if (fflush(fp)!=0){ fclose(fp); return -1; }
     if (fsync(fileno(fp))!=0){ fclose(fp); return -1; }
     if (fclose(fp)!=0) return -1;
     if (rename(path_tmp, path)!=0) return -1;
-    rc=0;
-    return rc;
+    return 0;
 }
 
 static int load_ini_text(const char *text, struct config *c){
@@ -397,7 +207,7 @@ static int load_ini_text(const char *text, struct config *c){
         } else if(!strcmp(key,"rcvbuf")){
             int v=parse_int_bounded(val,1024,64*1024*1024); if(v>0) c->rcvbuf=v;
         } else if(!strcmp(key,"sndbuf")){
-            int v=parse_int_bounded(val,1024,64*102*1024*5); if(v>0) c->sndbuf=v; /* generous */
+            int v=parse_int_bounded(val,1024,64*1024*1024); if(v>0) c->sndbuf=v;
         } else if(!strcmp(key,"bufsz")){
             int v=parse_int_bounded(val,512,64*1024); if(v>0) c->bufsz=v;
         } else if(!strcmp(key,"tos")){
@@ -407,7 +217,7 @@ static int load_ini_text(const char *text, struct config *c){
                 snprintf(c->bind_lines[c->bind_count++],MAX_LINE,"%s",val);
             }
         }
-        /* unknown keys ignored */
+        /* UI-only keys are ignored here deliberately (dest_*) */
     }
     free(dup);
     return 0;
@@ -416,7 +226,6 @@ static int load_ini_text(const char *text, struct config *c){
 static int load_ini_file(struct config *c){
     char *txt=NULL; size_t len=0;
     if (load_file(CFG_PATH,&txt,&len)!=0) {
-        /* missing file is not fatal; run with defaults */
         cfg_defaults(c);
         return 0;
     }
@@ -425,7 +234,7 @@ static int load_ini_file(struct config *c){
     return rc;
 }
 
-/* ------------------- relay creation / teardown --------------- */
+/* ------------------- relay helpers -------------------------- */
 
 static int sockaddr_equal(const struct sockaddr_in *a, const struct sockaddr_in *b){
     return a->sin_family==b->sin_family &&
@@ -565,10 +374,10 @@ static int apply_config_relays(const struct config *c){
 
 struct http_conn {
     int fd;
-    char *buf;        /* request buffer */
-    size_t cap, len;  /* capacity / used */
-    size_t need;      /* body bytes expected (Content-Length) */
-    int    have_hdr;  /* header parsed? */
+    char *buf;
+    size_t cap, len;
+    size_t need;
+    int    have_hdr;
 };
 static struct http_conn HC[MAX_HTTP_CONN];
 
@@ -581,6 +390,10 @@ static struct http_conn* hc_get(int fd){
     }
     return NULL;
 }
+static struct http_conn* hc_find(int fd){
+    for (int i=0;i<MAX_HTTP_CONN;i++) if (HC[i].fd==fd) return &HC[i];
+    return NULL;
+}
 static void hc_del(int fd){
     for (int i=0;i<MAX_HTTP_CONN;i++) if (HC[i].fd==fd){
         free(HC[i].buf); HC[i].buf=NULL; HC[i].fd=0; HC[i].cap=HC[i].len=HC[i].need=HC[i].have_hdr=0;
@@ -588,11 +401,6 @@ static void hc_del(int fd){
         close(fd);
         return;
     }
-}
-
-static struct http_conn* hc_find(int fd){
-    for (int i=0;i<MAX_HTTP_CONN;i++) if (HC[i].fd==fd) return &HC[i];
-    return NULL;
 }
 
 static int http_listen(const char *ip, int port){
@@ -609,7 +417,15 @@ static int http_listen(const char *ip, int port){
     return s;
 }
 
-/* ---- very tiny JSON helpers (sufficient for our schemas) ---- */
+/* ---- tiny JSON helpers ---- */
+
+
+/* Remove any ?query=... part so routes match cleanly */
+static void strip_query(char *path){
+    char *q = strchr(path, '?');
+    if (q) *q = '\0';
+}
+
 
 static int json_get_int(const char *body, const char *key, int defv){
     const char *p = strstr(body, key);
@@ -625,14 +441,48 @@ static int json_get_int(const char *body, const char *key, int defv){
 
 static int json_extract_port(const char *b){ return json_get_int(b,"\"port\"", -1); }
 
-static char* json_extract_array_slice(const char *body, const char *key){
-    const char *k=strstr(body,key); if(!k) return NULL;
-    const char *lb=strchr(k,'['); if(!lb) return NULL;
-    const char *rb=strchr(lb,']'); if(!rb) return NULL;
-    size_t n=(size_t)(rb - (lb+1));
-    char *out=malloc(n+1); if(!out) return NULL;
-    memcpy(out, lb+1, n); out[n]=0;
-    return out;
+/* extract {"dest":"ip:port"} into ip/port; returns 0 on success */
+static int json_extract_dest_token(const char *body, char *ip, size_t iplen, int *port){
+    const char *k = strstr(body, "\"dest\"");
+    if (!k) return -1;
+    const char *colon = strchr(k, ':');
+    if (!colon) return -1;
+    const char *v1 = strchr(colon, '"');
+    if (!v1) return -1;
+    v1++;
+    const char *v2 = strchr(v1, '"');
+    if (!v2) return -1;
+
+    char token[128] = {0};
+    size_t n = (size_t)(v2 - v1);
+    if (n >= sizeof(token)) n = sizeof(token) - 1;
+    memcpy(token, v1, n);
+    token[n] = 0;
+
+    char *c = strchr(token, ':');
+    if (!c) return -1;
+    *c = 0;
+    int p = parse_int_bounded(c + 1, 1, 65535);
+    if (p < 0) return -1;
+
+    snprintf(ip, iplen, "%s", token);
+    *port = p;
+    return 0;
+}
+
+/* For clear_to, also accept "ip" and "port" fields */
+static int json_extract_ip_port(const char *body, char *ip, size_t iplen, int *port){
+    const char *ki = strstr(body, "\"ip\"");
+    const char *kp = strstr(body, "\"port\"");
+    if (!ki || !kp) return -1;
+    const char *q = strchr(ki, '"'); if(!q) return -1;
+    q = strchr(q+1,'"'); if(!q) return -1;
+    const char *q2 = strchr(q+1,'"'); if(!q2) return -1;
+    size_t n=(size_t)(q2-(q+1)); if (n>=iplen) n=iplen-1;
+    memcpy(ip,q+1,n); ip[n]=0;
+    int p = json_get_int(body,"\"port\"", -1); if (p<=0) return -1;
+    *port=p;
+    return 0;
 }
 
 /* dests: ["9000","1.2.3.4:7000","7000-7005"] */
@@ -641,8 +491,14 @@ static int apply_set_like(int port, const char *body, bool replace){
     struct relay *r=NULL; for (int i=0;i<REL_N;i++) if (REL[i].src_port==port){ r=&REL[i]; break; }
     if (!r) return -2;
 
-    char *arr = json_extract_array_slice(body, "\"dests\"");
-    if (!arr) return -3;
+    /* Extract array slice of dests */
+    const char *key="\"dests\"";
+    const char *k=strstr(body,key); if(!k) return -3;
+    const char *lb=strchr(k,'['); if(!lb) return -3;
+    const char *rb=strchr(lb,']'); if(!rb) return -3;
+    size_t n=(size_t)(rb - (lb+1));
+    char *arr=malloc(n+1); if(!arr) return -3;
+    memcpy(arr, lb+1, n); arr[n]=0;
 
     struct relay tmp={0};
     char *s=arr;
@@ -652,7 +508,7 @@ static int apply_set_like(int port, const char *body, bool replace){
         if (*s=='"'){
             s++; char *e=strchr(s,'"'); if(!e) break;
             *e=0;
-            if (parse_dest_token(&tmp,s)<0){ free(arr); return -4; }
+            if (parse_dest_token(&tmp, s)<0){ free(arr); return -4; }
             s=e+1;
         } else {
             char *e=s; while(*e && *e!=',') e++;
@@ -664,15 +520,14 @@ static int apply_set_like(int port, const char *body, bool replace){
     free(arr);
 
     if (replace){
-        r->dest_cnt=0; r->pkts_in=r->bytes_in=r->bytes_out=r->send_errs=0;
-        for(int j=0;j<MAX_DESTS;j++) r->dests[j].pkts_out=0;
+        r->dest_cnt=0; /* stats preserved */
     }
     for (int i=0;i<tmp.dest_cnt && r->dest_cnt<MAX_DESTS;i++)
         r->dests[r->dest_cnt++]=tmp.dests[i];
     return 0;
 }
 
-/* append_range: {"port":5801,"ip":"1.2.3.4","start":7000,"end":7005} (ip optional, default 127.0.0.1) */
+/* append_range: {"port":5801,"ip":"1.2.3.4","start":7000,"end":7005} (ip optional) */
 static int apply_append_range(const char *body){
     int port=json_extract_port(body); if(port<=0) return -1;
     int start=json_get_int(body,"\"start\"", -1);
@@ -680,13 +535,12 @@ static int apply_append_range(const char *body){
     if (start<=0 || end<=0) return -1;
     if (start>end){ int t=start; start=end; end=t; }
 
-    const char *k=strstr(body,"\"ip\"");
     char ip[64]="127.0.0.1";
+    const char *k=strstr(body,"\"ip\"");
     if (k){
         const char *q=strchr(k,'"'); if(q){ q=strchr(q+1,'"'); if(q){ const char *q2=strchr(q+1,'"'); if(q2){
             size_t n=(size_t)(q2-(q+1)); if (n>0 && n<sizeof(ip)){ memcpy(ip,q+1,n); ip[n]=0; }
-        }}}
-    }
+        }}}}
     struct relay *r=NULL; for (int i=0;i<REL_N;i++) if (REL[i].src_port==port){ r=&REL[i]; break; }
     if (!r) return -2;
 
@@ -696,63 +550,283 @@ static int apply_append_range(const char *body){
     return 0;
 }
 
-/* ------------------- HTTP route handlers --------------------- */
+/* Remove one destination from one relay (atomic) */
+static int apply_clear_to(const char *body){
+    int port = json_extract_port(body);
+    char ip[64]={0}; int dport=-1;
+    if (port<=0) return -1;
 
-/* JSON status writer with CORS */
-static void http_handle_status(int fd){
-    char out[STATUS_CAP+1];
-    size_t off = 0;
-    #define PUT(fmt,...) do{ int _n=snprintf(out+off, sizeof(out)-off, fmt, ##__VA_ARGS__); if(_n<0) _n=0; if((size_t)_n>sizeof(out)-off) _n=(int)(sizeof(out)-off); off += (size_t)_n; }while(0)
-    PUT("{\"relays\":[");
-    for(int i=0;i<REL_N;i++){
-        if(i) PUT(",");
-        struct relay *r=&REL[i];
-        PUT("{\"port\":%d,\"pkts_in\":%" PRIu64 ",\"bytes_in\":%" PRIu64 ",\"bytes_out\":%" PRIu64 ",\"send_errs\":%" PRIu64 ",\"last_rx_ns\":%" PRIu64 ",\"dests\":[",
-            r->src_port, r->pkts_in, r->bytes_in, r->bytes_out, r->send_errs, r->last_rx_ns);
-        for(int j=0;j<r->dest_cnt;j++){
-            if(j) PUT(",");
-            char ip[INET_ADDRSTRLEN]; inet_ntop(AF_INET,&r->dests[j].addr.sin_addr,ip,sizeof(ip));
-            PUT("{\"ip\":\"%s\",\"port\":%d,\"pkts\":%" PRIu64 "}", ip, ntohs(r->dests[j].addr.sin_port), r->dests[j].pkts_out);
-        }
-        PUT("]}");
+    /* Accept either {"dest":"ip:port"} or {"ip":"..","port":..} */
+    if (json_extract_dest_token(body, ip, sizeof(ip), &dport)!=0){
+        if (json_extract_ip_port(body, ip, sizeof(ip), &dport)!=0) return -1;
     }
-    PUT("]}\n");
-    http_send_headers(fd, "HTTP/1.1 200 OK", "application/json", (ssize_t)off, NULL);
-    http_write(fd, out, off);
+
+    struct relay *r=NULL; for (int i=0;i<REL_N;i++) if (REL[i].src_port==port){ r=&REL[i]; break; }
+    if (!r) return -2;
+
+    struct sockaddr_in target={0};
+    target.sin_family=AF_INET;
+    target.sin_port=htons(dport);
+    if (inet_pton(AF_INET, ip, &target.sin_addr)!=1) return -1;
+
+    int idx=-1;
+    for (int j=0;j<r->dest_cnt;j++){
+        if (sockaddr_equal(&r->dests[j].addr, &target)){ idx=j; break; }
+    }
+    if (idx<0) return -3;
+
+    /* remove by swapping with last to keep O(1) */
+    r->dests[idx] = r->dests[r->dest_cnt-1];
+    r->dest_cnt--;
+    return 0;
+}
+
+static void http_send(int fd, const char *fmt, ...){
+    char buf[4096];
+    va_list ap; va_start(ap,fmt);
+    int n=vsnprintf(buf,sizeof(buf),fmt,ap);
+    va_end(ap);
+    if (n<0) return;
+    (void)send(fd, buf, (size_t)n, 0);
+}
+
+/* ------------------- UI assets (HTML/JS) --------------------- */
+static const char UI_HTML[] =
+"<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"/>"
+"<meta name=\"viewport\" content=\"width=device-width,initial-scale=1,maximum-scale=1\"/>"
+"<title>UDP Relay Manager · WebUI</title>"
+"<style>"
+":root{--bg:#0f1116;--panel:#151823;--muted:#8a93a5;--text:#e8ecf1;--accent:#7bd389;--warn:#e7b75f;--err:#ff7a7a;"
+"--green:#13391f;--green-b:#1f6b43;--blue:#0f2a45;--blue-b:#2366a2;--yellow:#3b2e13;--yellow-b:#a68124}"
+"*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}"
+"body{margin:0;font:15px/1.45 system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:var(--bg);color:var(--text)}"
+"header{display:flex;gap:.75rem;flex-wrap:wrap;align-items:center;padding:14px 16px;background:#0c0f17;position:sticky;top:0;z-index:2;border-bottom:1px solid #1e2231}"
+"h1{font-size:18px;margin:0 auto 0 0;letter-spacing:.2px}"
+"button,input,textarea,select{font:inherit}"
+"label{font-size:12px;color:var(--muted)}"
+"input,button,textarea,select{background:var(--panel);color:var(--text);border:1px solid #242b3d;border-radius:12px;padding:12px 14px;outline:0}"
+"button{cursor:pointer;min-height:44px;border-radius:14px}"
+"button.primary{background:linear-gradient(180deg,#1f6b43,#165538);border-color:#1f6b43}"
+"button.warn{background:#3b2e13;border-color:#5c4723;color:#ffd990}"
+".pill{border-radius:999px;padding:8px 12px}"
+"main{max-width:1200px;margin:16px auto;padding:0 12px;display:grid;grid-template-columns:1.05fr .95fr;gap:14px}"
+"@media(max-width:980px){main{grid-template-columns:1fr;gap:12px}}"
+"section{background:var(--panel);border:1px solid #20273a;border-radius:18px;overflow:hidden}"
+"section h2{margin:0;padding:10px 12px;border-bottom:1px solid #20273a;font-size:14px;color:#aab3c7;background:#121626;letter-spacing:.3px}"
+".pad{padding:12px}"
+".chips{display:flex;flex-wrap:wrap;gap:10px}"
+".chip{border:2px dashed #2a3247;border-radius:22px;padding:10px 14px;display:flex;gap:10px;align-items:center;user-select:none;min-height:44px;min-width:120px;touch-action:none}"
+".chip[draggable=true]{cursor:grab}"
+".chip.selected{outline:3px solid #4ea2ff}"
+".chip .tag{opacity:.7;font-size:12px}"
+".chip .x{margin-left:8px;border:none;background:transparent;color:#ffb3b3;font-weight:700;cursor:pointer;padding:2px 6px;border-radius:8px;min-height:0}"
+".chip .x:hover{background:#2a0f0f}.chip .x:active{transform:scale(0.96)}"
+".grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:12px}"
+".dest{min-height:100px;border:3px dashed #2b344d;border-radius:16px;display:flex;align-items:center;justify-content:space-between;gap:10px;padding:14px;transition:.15s;touch-action:none}"
+".dest.drag-over{transform:scale(0.99)}"
+".dest .info{display:flex;flex-direction:column;gap:4px}"
+".dest .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,\"Liberation Mono\",monospace;font-size:14px}"
+".row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}"
+".muted{color:var(--muted)}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,\"Liberation Mono\",monospace}"
+".rowline{display:flex;justify-content:space-between;gap:8px;border:1px solid #252d40;border-radius:12px;padding:10px 12px;margin-bottom:8px}"
+"textarea.ini{width:100%;min-height:220px;resize:vertical;border-radius:14px}"
+".log{height:160px;overflow:auto;background:#0c0f17;border:1px solid #1e2231;border-radius:12px;padding:10px}"
+".ok{color:var(--accent)}.warn{color:var(--warn)}.err{color:var(--err)}"
+".g{background:var(--green);border-color:var(--green-b)}"
+".b{background:var(--blue);border-color:var(--blue-b)}"
+".y{background:var(--yellow);border-color:var(--yellow-b)}"
+".dest .actions{display:flex;gap:8px}"
+"</style></head><body>"
+"<header>"
+"<h1>UDP Relay Manager · WebUI</h1>"
+"<button class=\"primary pill\" id=\"refresh\">Refresh</button>"
+"<button class=\"warn pill\" id=\"clearAll\">Clear ALL</button>"
+"</header>"
+"<main>"
+"<section><h2>Binds — drag or tap-then-tap</h2><div class=\"pad\">"
+"<div class=\"chips\" id=\"bindChips\"></div>"
+"</div></section>"
+
+"<section><h2>Destinations</h2><div class=\"pad\">"
+"<div class=\"muted\" style=\"margin-bottom:8px\">Green=Video (1→1), Blue=Many→1 (mavlink/OSD), Yellow=1→Many (split)</div>"
+"<div id=\"destGridG\" class=\"grid\" style=\"margin-bottom:12px\"></div>"
+"<div id=\"destGridB\" class=\"grid\" style=\"margin-bottom:12px\"></div>"
+"<div id=\"destGridY\" class=\"grid\"></div>"
+"</div></section>"
+
+"<section><h2>Live Status</h2><div class=\"pad\" id=\"statusBox\"><div class=\"muted\">Loading…</div></div></section>"
+
+"<section><h2>Manage Config</h2><div class=\"pad\">"
+"<div class=\"row\">"
+"<input id=\"newBindPort\" placeholder=\"add bind (e.g. 5704)\" style=\"min-width:160px\"/>"
+"<button id=\"addBind\">Add bind</button>"
+"<input id=\"newDestHost\" placeholder=\"host (e.g. 127.0.0.1)\" style=\"min-width:200px\"/>"
+"<input id=\"newDestPort\" placeholder=\"port (e.g. 5600)\" style=\"min-width:140px\"/>"
+"<select id=\"newDestType\"><option value=\"green\">green (1→1)</option><option value=\"blue\">blue (many→1)</option><option value=\"yellow\">yellow (1→many)</option></select>"
+"<button id=\"addDest\">Add destination</button>"
+"<button class=\"warn\" id=\"saveCfg\">Save config</button>"
+"</div>"
+"<div id=\"bindList\" style=\"margin:10px 0\"></div>"
+"<label>Config (INI)</label>"
+"<textarea id=\"cfgText\" class=\"ini mono\" spellcheck=\"false\"></textarea>"
+"</div></section>"
+
+"<section><h2>Log</h2><div class=\"pad\"><div id=\"log\" class=\"log mono\"></div></div></section>"
+"</main>"
+"<script src=\"/ui.js\"></script>"
+"</body></html>";
+
+
+static const char UI_JS[] =
+"(function(){"
+"const $=s=>document.querySelector(s);"
+"const log=(m,c='')=>{const el=$('#log');const d=document.createElement('div');if(c)d.className=c;d.textContent=`[${new Date().toLocaleTimeString()}] ${m}`;el.prepend(d)};"
+"const GET=p=>fetch(p).then(r=>{if(!r.ok)throw new Error(r.statusText);return p.includes('/status')?r.json():r.text()});"
+"const POST=(p,b)=>fetch(p,{method:'POST',headers:{'Content-Type':'application/json'},body:b}).then(async r=>{if(!r.ok)throw new Error(r.statusText);try{return await r.json()}catch{return await r.text()}});"
+"const action=(v,o)=>POST(`/api/v1/action/${v}`,JSON.stringify(o||{}));"
+"const state={status:null,ini:'',dG:[],dB:[],dY:[],selected:null};"
+"const normDest=s=>{s=String(s||'').trim();const m=s.match(/^([^:\\s]+):([0-9]+)$/);return m?`${m[1]}:${m[2]}`:null};"
+
+"function parseDests(txt){const g=new Set(),b=new Set(),y=new Set();for(const ln of txt.split(/\\n/)){let m;"
+" if((m=ln.match(/^\\s*dest_green\\s*=\\s*(\\S+)/))) {const d=normDest(m[1]);if(d)g.add(d);continue;} "
+" if((m=ln.match(/^\\s*dest_blue\\s*=\\s*(\\S+)/)))  {const d=normDest(m[1]);if(d)b.add(d);continue;} "
+" if((m=ln.match(/^\\s*dest_yellow\\s*=\\s*(\\S+)/))){const d=normDest(m[1]);if(d)y.add(d);continue;} "
+" if((m=ln.match(/^\\s*ui_dest_green\\s*=\\s*(.+)$/))) m[1].split(',').forEach(t=>{const d=normDest(t);if(d)g.add(d)});"
+" if((m=ln.match(/^\\s*ui_dest_blue\\s*=\\s*(.+)$/)))  m[1].split(',').forEach(t=>{const d=normDest(t);if(d)b.add(d)});"
+" if((m=ln.match(/^\\s*ui_dest_yellow\\s*=\\s*(.+)$/)))m[1].split(',').forEach(t=>{const d=normDest(t);if(d)y.add(d)});"
+"} return {g:[...g],b:[...b],y:[...y]};}"
+"function writeDests(txt,{g,b,y}){const out=[];for(const ln of txt.split(/\\n/)){if(/^\\s*(dest_green|dest_blue|dest_yellow|ui_dest_green|ui_dest_blue|ui_dest_yellow)\\s*=/.test(ln)) continue; out.push(ln);} "
+" if(out.length && out[out.length-1]!=='') out.push('');"
+" for(const d of g) out.push(`dest_green=${d}`);"
+" for(const d of b) out.push(`dest_blue=${d}`);"
+" for(const d of y) out.push(`dest_yellow=${d}`);"
+" return out.join('\\n'); }"
+
+"async function loadStatus(){try{const s=await GET('/api/v1/status');state.status=s;renderBinds(s);renderStatus(s)}catch(e){$('#statusBox').innerHTML=`<span class=err>${e}</span>`}}"
+"async function loadConfig(){const t=await GET('/api/v1/config');state.ini=String(t||'').replace(/\\r/g,'');const {g,b,y}=parseDests(state.ini);state.dG=g;state.dB=b;state.dY=y;$('#cfgText').value=state.ini;renderConfigLists();renderDestGrids();}"
+
+"const relays=()=> (state.status&&state.status.relays)||[];"
+"const findRelay=p=> relays().find(r=>r.port===p);"
+"const listTokens=r=> (r.dests||[]).map(d=>`${d.ip}:${d.port}`);"
+
+"async function removeDestFromPort(port,dest){await action('clear_to',{port,dest});}"
+"async function clearDestinationEverywhere(dest){for(const r of relays()){if(listTokens(r).includes(dest)) await removeDestFromPort(r.port,dest);} }"
+"async function clearAll(){for(const r of relays()) await action('clear',{port:r.port});}"
+
+"async function dropGreen(srcPort,dest){await clearDestinationEverywhere(dest);await action('set',{port:srcPort,dests:[dest]});log(`bind ${srcPort} → ${dest} (exclusive)`,'ok');await loadStatus();}"
+"async function dropBlue(srcPort,dest){const r=findRelay(srcPort);if(!r) return;const tokens=new Set(listTokens(r));if(!tokens.has(dest)){await action('append',{port:srcPort,dests:[dest]});log(`bind ${srcPort} +→ ${dest}`,'ok');}else{log(`already mapped: ${srcPort} has ${dest}`,'warn');}await loadStatus();}"
+"async function dropYellow(srcPort,dest){return dropBlue(srcPort,dest);}"
+
+"function bindDropZone(el,dest,type){const onDo=(src)=>{if(type==='g') return dropGreen(src,dest); if(type==='b') return dropBlue(src,dest); return dropYellow(src,dest);};"
+" const allow=e=>{e.preventDefault();e.stopPropagation();};"
+" el.addEventListener('dragenter',allow);"
+" el.addEventListener('dragover',e=>{allow(e);el.classList.add('drag-over')});"
+" el.addEventListener('dragleave',()=>el.classList.remove('drag-over'));"
+" el.addEventListener('drop',e=>{allow(e);el.classList.remove('drag-over');const txt=e.dataTransfer.getData('text/plain');const p=parseInt(txt,10);if(p) onDo(p).catch(err=>log(err,'err'));});"
+" el.addEventListener('click',()=>{ if(state.selected){onDo(state.selected).catch(err=>log(err,'err'));} });}"
+"function makeDestCard(dest,type){const card=document.createElement('div');card.className=`dest ${type}`.replace('g','g').replace('b','b').replace('y','y');"
+" const label=(type==='g')?'Video (1→1)':(type==='b')?'Many→1':'1→Many';"
+" card.innerHTML=`<div class='info'><div class='muted'>${label}</div><div class='mono'>${dest}</div></div><div class='actions'><button class='pill' data-cc='1'>Clear this</button></div>`;"
+" bindDropZone(card,dest,type);"
+" card.querySelector('button[data-cc]')?.addEventListener('click',async (e)=>{e.stopPropagation();await clearDestinationEverywhere(dest);log(`Cleared ${dest} from all binds`,'ok');await loadStatus();});"
+" return card; }"
+"function renderDestGrids(){const g=$('#destGridG'), b=$('#destGridB'), y=$('#destGridY'); g.innerHTML=''; b.innerHTML=''; y.innerHTML='';"
+" if(!state.dG.length && !state.dB.length && !state.dY.length){const m=document.createElement('div');m.className='muted';m.textContent='No destinations configured. Use Manage Config to add dest_* lines.'; g.appendChild(m); return;}"
+" for(const d of state.dG) g.appendChild(makeDestCard(d,'g'));"
+" for(const d of state.dB) b.appendChild(makeDestCard(d,'b'));"
+" for(const d of state.dY) y.appendChild(makeDestCard(d,'y')); }"
+
+"function renderBinds(s){const wrap=$('#bindChips');const sel=state.selected;wrap.innerHTML='';(s.relays||[]).forEach(r=>{const el=document.createElement('div');el.className='chip';el.draggable=true;el.dataset.port=String(r.port);el.innerHTML=`<strong>bind ${r.port}</strong> <span class='tag'>in:${r.pkts_in||0}</span>`;"
+" el.addEventListener('dragstart',e=>{e.dataTransfer.setData('text/plain',String(r.port));e.dataTransfer.effectAllowed='copy'});"
+" el.addEventListener('click',()=>{ if(state.selected===r.port){state.selected=null;el.classList.remove('selected');} else {state.selected=r.port;document.querySelectorAll('.chip').forEach(c=>c.classList.remove('selected'));el.classList.add('selected');}});"
+" if(sel===r.port) el.classList.add('selected');"
+" wrap.appendChild(el);});}"
+
+"function renderStatus(s){const box=$('#statusBox');if(!s||!Array.isArray(s.relays)){box.innerHTML='<div class=muted>No relays</div>';return}"
+" const frag=document.createDocumentFragment(); for(const r of s.relays){const outPkts=Array.isArray(r.dests)?r.dests.reduce((a,d)=>a+(d.pkts||0),0):0;const oneToOne=(Array.isArray(r.dests)&&r.dests.length===1);"
+" const row=document.createElement('div');row.className='rowline';"
+" const left=document.createElement('div');left.innerHTML=`<strong>bind ${r.port}</strong><div class='muted'>in pkts ${r.pkts_in} · out pkts ${outPkts}${oneToOne?' (1→1)':''} · out bytes ${r.bytes_out} · errs ${r.send_errs}</div>`;"
+" const right=document.createElement('div');const clr=document.createElement('button');clr.textContent='Clear bind';clr.onclick=()=>action('clear',{port:r.port}).then(()=>{log(`cleared ${r.port}`,'ok');loadStatus()}).catch(e=>log(e,'err'));right.appendChild(clr);"
+" const dests=document.createElement('div');dests.className='chips';dests.style.marginTop='6px';"
+" if(Array.isArray(r.dests)&&r.dests.length){for(const d of r.dests){const token=`${d.ip}:${d.port}`;const c=document.createElement('div');c.className='chip';c.innerHTML=`<span class='tag'>→</span><strong>${token}</strong> <span class='tag'>pkts ${d.pkts}</span>`;const x=document.createElement('button');x.className='x';x.title='Remove this destination from this bind';x.textContent='×';x.onclick=(e)=>{e.stopPropagation();removeDestFromPort(r.port,token).then(()=>{log(`Removed ${token} from bind ${r.port}`,'ok');loadStatus()}).catch(err=>log(err,'err'));};c.appendChild(x);dests.appendChild(c)} } else {const m=document.createElement('div');m.className='muted';m.textContent='no destinations';dests.appendChild(m)}"
+" row.appendChild(left);row.appendChild(right);frag.appendChild(row);frag.appendChild(dests);} "
+" box.innerHTML='';box.appendChild(frag);} "
+
+"function renderConfigLists(){const binds=[];for(const ln of state.ini.split(/\\n/)){const m=ln.match(/^\\s*bind\\s*=\\s*(\\d+)/);if(m)binds.push(+m[1]);}"
+" const list=$('#bindList'); list.innerHTML=''; if(!binds.length){list.innerHTML='<div class=muted>No binds in config.</div>';return}"
+" for(const p of binds){const row=document.createElement('div');row.className='rowline';row.innerHTML=`<div class=mono>bind=${p}</div>`;const rm=document.createElement('button');rm.textContent='Remove';rm.onclick=()=>{state.ini=state.ini.split(/\\n/).filter(l=>!l.match(new RegExp(`^\\\\s*bind\\\\s*=\\\\s*${p}(\\\\b|:)`))).join('\\n');$('#cfgText').value=state.ini;renderConfigLists();};row.appendChild(rm);list.appendChild(row);} }"
+
+"$('#addBind').onclick=()=>{const v=parseInt($('#newBindPort').value,10);if(!(v>0&&v<65536)) return log('Invalid bind port','err'); if(new RegExp(`^\\\\s*bind\\\\s*=\\\\s*${v}(\\\\b|:)`,'m').test(state.ini)) return log('bind exists','warn'); state.ini+=(/\\n$/.test(state.ini)?'':'\\n')+`bind=${v}\\n`; $('#cfgText').value=state.ini; renderConfigLists(); };"
+"$('#addDest').onclick=()=>{const h=$('#newDestHost').value.trim()||'127.0.0.1';const p=parseInt($('#newDestPort').value,10);if(!(p>0&&p<65536)) return log('Invalid dest port','err'); const t=$('#newDestType').value; const d=`${h}:${p}`; if(t==='green' && !state.dG.includes(d)) state.dG.push(d); if(t==='blue' && !state.dB.includes(d)) state.dB.push(d); if(t==='yellow' && !state.dY.includes(d)) state.dY.push(d); state.ini=writeDests(state.ini,{g:state.dG,b:state.dB,y:state.dY}); $('#cfgText').value=state.ini; renderDestGrids(); };"
+"$('#saveCfg').onclick=async()=>{try{await POST('/api/v1/config',$('#cfgText').value);log('Config saved & reloaded','ok');await refreshAll()}catch(e){log(e,'err')}};"
+"$('#refresh').onclick=()=>refreshAll();"
+"$('#clearAll').onclick=async()=>{try{await clearAll();log('All mappings cleared','ok');await loadStatus()}catch(e){log(e,'err')}};"
+
+"async function refreshAll(){await Promise.all([loadConfig(),loadStatus()])}"
+"refreshAll(); setInterval(()=>loadStatus().catch(()=>{}),1500);"
+"})();";
+
+/* ------------------- HTTP handlers -------------------------- */
+
+static void http_send_200_plain(int fd, const char *ctype){
+    http_send(fd,"HTTP/1.0 200 OK\r\nContent-Type: %s\r\nConnection: close\r\n\r\n", ctype);
+}
+
+/* Ensure status JSON ≤ STATUS_CAP (soft cap); we can truncate tail if needed. */
+static void http_handle_status(int fd){
+    char out[STATUS_CAP+256]; size_t off=0;
+    #define APPEND(fmt,...) do{ \
+        int _n = snprintf(out+off, sizeof(out)-off, fmt, ##__VA_ARGS__); \
+        if(_n<0) _n=0; if ((size_t)_n > sizeof(out)-off) _n = (int)(sizeof(out)-off); \
+        off += (size_t)_n; if (off>=STATUS_CAP) goto SEND; \
+    }while(0)
+
+    APPEND("HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n");
+    APPEND("{\"relays\":[");
+    for (int i=0;i<REL_N;i++){
+        if (i) APPEND(",");
+        struct relay *r=&REL[i];
+        uint64_t pkts_out_total=0;
+        for (int j=0;j<r->dest_cnt;j++) pkts_out_total += r->dests[j].pkts_out;
+        APPEND("{\"port\":%d,\"pkts_in\":%" PRIu64 ",\"bytes_in\":%" PRIu64 ",\"bytes_out\":%" PRIu64 ",\"send_errs\":%" PRIu64 ",\"last_rx_ns\":%" PRIu64 ",\"pkts_out_total\":%" PRIu64 ",\"dests\":[",
+               r->src_port, r->pkts_in, r->bytes_in, r->bytes_out, r->send_errs, r->last_rx_ns, pkts_out_total);
+        for (int j=0;j<r->dest_cnt;j++){
+            if (j) APPEND(",");
+            char ip[INET_ADDRSTRLEN]; inet_ntop(AF_INET,&r->dests[j].addr.sin_addr,ip,sizeof(ip));
+            APPEND("{\"ip\":\"%s\",\"port\":%d,\"pkts\":%" PRIu64 "}", ip,
+                   ntohs(r->dests[j].addr.sin_port), r->dests[j].pkts_out);
+        }
+        APPEND("]}");
+    }
+    APPEND("]}\n");
+SEND:
+    (void)send(fd, out, off, 0);
 }
 
 static void http_handle_get_config(int fd){
     char *txt=NULL; size_t len=0;
     if (load_file(CFG_PATH,&txt,&len)!=0){
-        const char *m="missing config\n";
-        http_send_headers(fd, "HTTP/1.1 404 Not Found", "text/plain", (ssize_t)strlen(m), NULL);
-        http_write(fd, m, strlen(m));
+        http_send(fd,"HTTP/1.0 404 Not Found\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nmissing config\n");
         return;
     }
-    http_send_headers(fd, "HTTP/1.1 200 OK", "text/plain; charset=utf-8", (ssize_t)len, NULL);
-    http_write(fd, txt, len);
+    http_send_200_plain(fd,"text/plain; charset=utf-8");
+    (void)send(fd, txt, len, 0);
     free(txt);
 }
 
 static void http_handle_post_config(int fd, const char *body, size_t len){
     if (save_file_atomic(CFG_TMP_PATH, CFG_PATH, body, len)!=0){
-        const char *m="persist failed\n";
-        http_send_headers(fd, "HTTP/1.1 500 Internal Server Error", "text/plain", (ssize_t)strlen(m), NULL);
-        http_write(fd, m, strlen(m));
+        http_send(fd,"HTTP/1.0 500 Internal Server Error\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\npersist failed\n");
         return;
     }
     struct config newc;
     if (load_ini_text(body, &newc)!=0){
-        const char *m="bad ini\n";
-        http_send_headers(fd, "HTTP/1.1 400 Bad Request", "text/plain", (ssize_t)strlen(m), NULL);
-        http_write(fd, m, strlen(m));
+        http_send(fd,"HTTP/1.0 400 Bad Request\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nbad ini\n");
         return;
     }
-    G = newc; /* swap */
+    G = newc;
     apply_config_relays(&G);
-    const char *ok="{\"ok\":true}\n";
-    http_send_headers(fd, "HTTP/1.1 200 OK", "application/json", (ssize_t)strlen(ok), NULL);
-    http_write(fd, ok, strlen(ok));
+    http_send(fd,"HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"ok\":true}\n");
 }
 
 static void http_handle_action(int fd, const char *verb, const char *body){
@@ -779,99 +853,77 @@ static void http_handle_action(int fd, const char *verb, const char *body){
                     for(int j=0;j<r->dest_cnt;j++) r->dests[j].pkts_out=0;
                     rc=0; }
         }
+    } else if (!strcmp(verb,"clear_to")){
+        rc=apply_clear_to(body);
     } else {
-        const char *m="unknown verb\n";
-        http_send_headers(fd, "HTTP/1.1 404 Not Found", "text/plain", (ssize_t)strlen(m), NULL);
-        http_write(fd, m, strlen(m));
+        http_send(fd,"HTTP/1.0 404 Not Found\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nunknown verb\n");
         return;
     }
-    if (rc==0){
-        const char *ok="{\"ok\":true}\n";
-        http_send_headers(fd, "HTTP/1.1 200 OK", "application/json", (ssize_t)strlen(ok), NULL);
-        http_write(fd, ok, strlen(ok));
-    } else {
-        const char *m="bad action\n";
-        http_send_headers(fd, "HTTP/1.1 400 Bad Request", "text/plain", (ssize_t)strlen(m), NULL);
-        http_write(fd, m, strlen(m));
-    }
+    if (rc==0) http_send(fd,"HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"ok\":true}\n");
+    else       http_send(fd,"HTTP/1.0 400 Bad Request\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nbad action\n");
 }
 
-/* ------------------- request parsing/dispatch ---------------- */
+/* ------------------- UI routes ------------------------------- */
+
+static void http_handle_ui(int fd){
+    http_send_200_plain(fd,"text/html; charset=utf-8");
+    (void)send(fd, UI_HTML, strlen(UI_HTML), 0);
+}
+static void http_handle_ui_js(int fd){
+    http_send_200_plain(fd,"application/javascript; charset=utf-8");
+    (void)send(fd, UI_JS, strlen(UI_JS), 0);
+}
 
 static void http_process_request(int fd, struct http_conn *hc){
-    /* Parse Request-Line */
     char *hdr = hc->buf;
     char *hdr_end = strstr(hdr, "\r\n\r\n");
-    if (!hdr_end) return; /* need more */
+    if (!hdr_end) return;
 
     char method[8]={0}, path[256]={0};
     if (sscanf(hdr,"%7s %255s",method,path)!=2){
-        http_send_headers(fd,"HTTP/1.1 400 Bad Request","text/plain",0,NULL); hc_del(fd); return;
+        http_send(fd,"HTTP/1.0 400 Bad Request\r\nConnection: close\r\n\r\n");
+        return;
     }
 
-    /* Content-Length (optional) */
+    // Normalize path: strip query string for routing
+    strip_query(path);
+
     size_t clen=0;
     char *cl = strcasestr(hdr,"Content-Length:");
     if (cl) clen = (size_t)strtoul(cl+15,NULL,10);
 
     size_t hdrlen = (size_t)(hdr_end + 4 - hdr);
     size_t have_body = (hc->len > hdrlen) ? hc->len - hdrlen : 0;
-    if (have_body < clen) return; /* need more body */
+    if (have_body < clen) return;
 
     const char *body = hc->buf + hdrlen;
 
-    /* CORS preflight */
-    if (!strcmp(method,"OPTIONS")){
-        http_send_headers(fd, "HTTP/1.1 204 No Content", NULL, 0, NULL);
-        hc_del(fd);
-        return;
-    }
-
-    /* Root → redirect to /ui */
-    if (!strcmp(method,"GET") && !strcmp(path,"/")){
-        http_send_headers(fd, "HTTP/1.1 302 Found", "text/plain", 0, "Location: /ui\r\n");
-        hc_del(fd);
-        return;
-    }
-
-    /* Serve UI */
-    if (!strcmp(method,"GET") && !strcmp(path,"/ui")){
-        http_send_headers(fd, "HTTP/1.1 200 OK", "text/html; charset=utf-8", (ssize_t)strlen(UI_HTML), NULL);
-        http_write(fd, UI_HTML, strlen(UI_HTML));
-        hc_del(fd);
-        return;
-    }
-    if (!strcmp(method,"GET") && !strcmp(path,"/ui.js")){
-        http_send_headers(fd, "HTTP/1.1 200 OK", "application/javascript; charset=utf-8", (ssize_t)strlen(UI_JS), NULL);
-        http_write(fd, UI_JS, strlen(UI_JS));
-        hc_del(fd);
-        return;
-    }
-
-    /* API routes */
+    // Routes
     if (!strcmp(method,"GET") && !strcmp(path,"/api/v1/status")){
         http_handle_status(fd);
-        hc_del(fd);
-        return;
     } else if (!strcmp(method,"GET") && !strcmp(path,"/api/v1/config")){
         http_handle_get_config(fd);
-        hc_del(fd);
-        return;
     } else if (!strcmp(method,"POST") && !strcmp(path,"/api/v1/config")){
         http_handle_post_config(fd, body, clen);
-        hc_del(fd);
-        return;
     } else if (!strcmp(method,"POST") && !strncmp(path,"/api/v1/action/",15)){
         const char *verb = path + 15;
         http_handle_action(fd, verb, body);
-        hc_del(fd);
-        return;
+    } else if (!strcmp(method,"GET") &&
+               ( !strcmp(path,"/ui") || !strcmp(path,"/ui/") || !strcmp(path,"/ui/index.html") )){
+        http_handle_ui(fd);
+    } else if (!strcmp(method,"GET") &&
+               (!strcmp(path,"/ui.js") )){
+        http_handle_ui_js(fd);
+    } else if (!strcmp(method,"GET") && !strcmp(path,"/favicon.ico")){
+        // Avoid noisy 404s from browsers asking for a favicon
+        http_send(fd,"HTTP/1.0 204 No Content\r\nConnection: close\r\n\r\n");
+    } else {
+        http_send(fd,"HTTP/1.0 404 Not Found\r\nConnection: close\r\n\r\n");
     }
 
-    /* Default 404 */
-    http_send_headers(fd,"HTTP/1.1 404 Not Found","text/plain",0,NULL);
     hc_del(fd);
 }
+
 
 /* ------------------- signal handlers ------------------------- */
 
@@ -880,10 +932,27 @@ static void sig_handler(int sig){
     else if (sig==SIGINT || sig==SIGTERM) WANT_EXIT=1;
 }
 
+/* ------------------- counter roll-over ----------------------- */
+
+static void maybe_rollover_relay(struct relay *r){
+    if (r->pkts_in > PKTS_ROLLOVER_LIMIT ||
+        r->bytes_in > BYTES_ROLLOVER_LIMIT ||
+        r->bytes_out > BYTES_ROLLOVER_LIMIT ||
+        r->send_errs > PKTS_ROLLOVER_LIMIT)
+    {
+        r->pkts_in  >>= 1;
+        r->bytes_in  >>= 1;
+        r->bytes_out >>= 1;
+        r->send_errs >>= 1;
+        for (int j=0;j<r->dest_cnt;j++){
+            r->dests[j].pkts_out >>= 1;
+        }
+    }
+}
+
 /* ------------------- main loop -------------------------------- */
 
 int main(void){
-    /* signals */
     struct sigaction sa={0};
     sa.sa_handler = sig_handler;
     sigaction(SIGHUP,&sa,NULL);
@@ -891,27 +960,22 @@ int main(void){
     sigaction(SIGTERM,&sa,NULL);
     signal(SIGPIPE, SIG_IGN);
 
-    /* epoll */
     EPFD = epoll_create1(EPOLL_CLOEXEC);
     if (EPFD<0){ perror("epoll_create1"); return 1; }
 
-    /* config */
     if (load_ini_file(&G)!=0){ fprintf(stderr,"Bad INI, using defaults\n"); cfg_defaults(&G); }
     if (G.bufsz<=0) G.bufsz=9000;
 
-    /* http listen */
     HTTP_LFD = http_listen(G.http_bind, G.control_port);
     if (HTTP_LFD<0){ fprintf(stderr,"HTTP listen failed\n"); return 1; }
     struct epoll_event ev={.events=EPOLLIN, .data.fd=HTTP_LFD};
     epoll_ctl(EPFD, EPOLL_CTL_ADD, HTTP_LFD, &ev);
 
-    /* relays */
     if (apply_config_relays(&G)!=0){
         fprintf(stderr,"No valid bind entries; exiting.\n");
         return 1;
     }
 
-    /* main epoll loop */
     struct epoll_event events[MAX_EVENTS];
     char *udp_buf = malloc((size_t)G.bufsz);
     if (!udp_buf){ perror("malloc"); return 1; }
@@ -964,7 +1028,7 @@ int main(void){
                 continue;
             }
 
-            /* HTTP client readable */
+            /* HTTP client readable: use hc_find (do not create for UDP fds) */
             struct http_conn *hc = hc_find(fd);
             if (hc && hc->fd==fd){
                 if (evs & (EPOLLHUP|EPOLLERR)){ hc_del(fd); continue; }
@@ -973,9 +1037,7 @@ int main(void){
                     while (1){
                         ssize_t r=recv(fd,tmp,sizeof(tmp),0);
                         if (r>0){
-                            if (hc->len + (size_t)r > HTTP_BUF_MAX){
-                                hc_del(fd); break;
-                            }
+                            if (hc->len + (size_t)r > HTTP_BUF_MAX){ hc_del(fd); break; }
                             if (hc->len + (size_t)r > hc->cap){
                                 size_t ncap = hc->cap*2; if (ncap < hc->len+(size_t)r) ncap = hc->len+(size_t)r;
                                 if (ncap>HTTP_BUF_MAX) ncap=HTTP_BUF_MAX;
@@ -985,12 +1047,8 @@ int main(void){
                             memcpy(hc->buf+hc->len, tmp, (size_t)r);
                             hc->len += (size_t)r;
                             http_process_request(fd, hc);
-                        } else if (r==0){
-                            hc_del(fd); break;
-                        } else {
-                            if (errno==EAGAIN||errno==EWOULDBLOCK) break;
-                            hc_del(fd); break;
-                        }
+                        } else if (r==0){ hc_del(fd); break; }
+                        else { if (errno==EAGAIN||errno==EWOULDBLOCK) break; hc_del(fd); break; }
                     }
                 }
                 continue;
@@ -998,7 +1056,6 @@ int main(void){
 
             /* UDP readable on a relay */
             if (evs & EPOLLIN){
-                /* find which relay */
                 struct relay *r=NULL; for (int k=0;k<REL_N;k++) if (REL[k].fd==fd){ r=&REL[k]; break; }
                 if (!r) continue;
 
@@ -1006,7 +1063,6 @@ int main(void){
                     ssize_t m = recv(fd, udp_buf, (size_t)G.bufsz, 0);
                     if (m>0){
                         r->pkts_in++; r->bytes_in += (uint64_t)m; r->last_rx_ns = now_ns();
-                        /* snapshot current dests (plain array copy) */
                         struct dest snap[MAX_DESTS]; int cnt=r->dest_cnt;
                         if (cnt>MAX_DESTS) cnt=MAX_DESTS;
                         if (cnt>0) memcpy(snap, r->dests, (size_t)cnt*sizeof(struct dest));
@@ -1015,7 +1071,6 @@ int main(void){
                                 if (!(errno==EAGAIN||errno==EWOULDBLOCK)) r->send_errs++;
                             } else {
                                 r->bytes_out += (uint64_t)m;
-                                /* bump pkts_out on real slot by matching addr */
                                 for (int j=0;j<r->dest_cnt;j++){
                                     if (sockaddr_equal(&r->dests[j].addr, &snap[d].addr)){
                                         r->dests[j].pkts_out++;
@@ -1024,17 +1079,16 @@ int main(void){
                                 }
                             }
                         }
+                        maybe_rollover_relay(r);
                     } else if (m<0){
                         if (errno==EAGAIN||errno==EWOULDBLOCK) break;
-                        /* other errors: drop */
                         break;
-                    } else { /* m==0 not meaningful for UDP */ break; }
+                    } else { break; }
                 }
             }
         }
     }
 
-    /* graceful */
     if (HTTP_LFD>=0){ epoll_ctl(EPFD, EPOLL_CTL_DEL, HTTP_LFD, NULL); close(HTTP_LFD); }
     close_relays();
     for (int i=0;i<MAX_HTTP_CONN;i++) if (HC[i].fd) hc_del(HC[i].fd);
